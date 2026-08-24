@@ -50,6 +50,49 @@ def test_nav_events_ratio(tmp_path):
     assert stats["nav_keyboard"] == 2
     assert stats["nav_mouse"] == 1
     assert stats["nav_keyboard_pct"] == pytest.approx(66.7, rel=0.01)
+    assert stats["mouse_weight"] == 1.0
+    store.close()
+
+
+def test_mouse_weight_persists_and_clamps(tmp_path):
+    store = make_storage(tmp_path)
+    assert store.mouse_weight() == 1.0
+    assert store.set_mouse_weight(2.5) == 2.5
+    assert store.mouse_weight() == 2.5
+    # out-of-range values clamp instead of being rejected silently or stored raw
+    assert store.set_mouse_weight(99) == 10.0
+    assert store.set_mouse_weight(0.01) == 0.1
+    with pytest.raises(ValueError):
+        store.set_mouse_weight("not-a-number")
+    # clamped-but-valid value survives a reopen
+    store.close()
+    reopened = make_storage(tmp_path)
+    reopened.set_mouse_weight(2.5)
+    reopened.close()
+    final = make_storage(tmp_path)
+    assert final.mouse_weight() == 2.5
+    final.close()
+
+
+def test_weighted_nav_split(tmp_path):
+    # weight 2.0: the single mouse event counts double against the keyboard
+    store = make_storage(tmp_path)
+    now = time.time()
+    store.queue_nav_event("keyboard", now)
+    store.queue_nav_event("keyboard", now)
+    store.queue_nav_event("mouse", now)
+    store.flush()
+    store.set_mouse_weight(2.0)
+
+    weighted = store.get_stats("today")
+    assert weighted["mouse_weight"] == 2.0
+    # pct = 2 / (2 + 1*2) = 50%, vs 66.7% unweighted
+    assert weighted["nav_keyboard_pct"] == 50.0
+
+    store.set_mouse_weight(0.5)
+    discounted = store.get_stats("today")
+    # pct = 2 / (2 + 1*0.5) = 80%
+    assert discounted["nav_keyboard_pct"] == 80.0
     store.close()
 
 

@@ -19,10 +19,18 @@ from keybinds import NavComboMatcher
 from wpm import TypingBurst, TypingTracker
 
 RESCAN_INTERVAL_S = 20
-MOUSE_MOTION_THRESHOLD = 8  # accumulated relative units before counting as "activity"
 
 _MOUSE_BUTTONS = frozenset({
     e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE, e.BTN_SIDE, e.BTN_EXTRA,
+})
+
+# Only deliberate pointer actions count as "mouse navigation": button clicks
+# and wheel scrolls. Pointer *motion* is deliberately excluded -- moving the
+# cursor happens constantly for non-navigation reasons and would swamp the
+# keyboard-vs-mouse split.
+_MOUSE_WHEEL = frozenset({
+    getattr(e, "REL_WHEEL", 8), getattr(e, "REL_HWHEEL", 11),
+    getattr(e, "REL_WHEEL_HI_RES", 12), getattr(e, "REL_HWHEEL_HI_RES", 13),
 })
 
 
@@ -42,7 +50,6 @@ class EvdevSource:
         self._typing = TypingTracker()
         self._stop = False
         self._devices: dict[str, asyncio.Task] = {}
-        self._rel_accum = 0
 
     def stop(self) -> None:
         self._stop = True
@@ -114,9 +121,7 @@ class EvdevSource:
             self._on_typing_burst(burst)
 
     def _handle_motion(self, code: int, value: int, now: float) -> None:
-        if code not in (e.REL_X, e.REL_Y):
-            return
-        self._rel_accum += abs(value)
-        if self._rel_accum >= MOUSE_MOTION_THRESHOLD:
+        # Wheel ticks are deliberate scroll actions -> count as mouse activity.
+        # Plain cursor motion (REL_X / REL_Y) is ignored on purpose.
+        if code in _MOUSE_WHEEL:
             self._on_mouse_activity(now)
-            self._rel_accum = 0

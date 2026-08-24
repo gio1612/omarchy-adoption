@@ -152,6 +152,14 @@ class Daemon:
         elif command == "stats":
             window = message.get("window", "today")
             result = response(request_id, True, self.storage.get_stats(window))
+        elif command == "set_mouse_weight":
+            try:
+                weight = self.storage.set_mouse_weight(message.get("value"))
+                result = response(request_id, True, {"mouse_weight": weight})
+                await self._push_stats_update()  # widgets re-render the split
+            except (TypeError, ValueError) as exc:
+                result = response(request_id, False, code="invalid_value",
+                                  message=str(exc))
         else:
             result = response(request_id, False, code="unknown_command",
                                message=f"Unknown command: {command!r}")

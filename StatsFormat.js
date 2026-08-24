@@ -20,11 +20,15 @@ function formatWindowLabel(windowKey) {
   return "Today"
 }
 
-function formatNavBreakdown(navKeyboardCount, navMouseCount) {
+function formatNavBreakdown(navKeyboardCount, navMouseCount, mouseWeight) {
   var total = (navKeyboardCount || 0) + (navMouseCount || 0)
   if (total === 0) return "No navigation recorded yet"
   var pct = Math.round(100 * navKeyboardCount / total)
-  return navKeyboardCount + " keyboard / " + navMouseCount + " mouse (" + pct + "% keyboard)"
+  var label = navKeyboardCount + " keyboard / " + navMouseCount + " mouse (" + pct + "% keyboard)"
+  if (mouseWeight && mouseWeight !== 1) {
+    label += " · mouse ×" + Number(mouseWeight).toFixed(1).replace(/\.0$/, "")
+  }
+  return label
 }
 
 function formatWpm(wpmAvg, wpmLast) {

@@ -26,8 +26,9 @@ class NavAttributor:
         self._last_kbd_nav_ts: float | None = None
 
     def note_mouse_activity(self, monotonic_ts: float) -> None:
-        """Call on a mouse button press, or pointer motion past a debounce
-        threshold -- both are decided by the caller (evdev_reader)."""
+        """Call on a mouse button press or wheel-scroll tick -- both are
+        decided by the caller (evdev_reader). Pointer motion is never
+        forwarded, so it can't contaminate the split."""
         self._last_mouse_ts = monotonic_ts
 
     def note_keyboard_nav_combo(self, monotonic_ts: float) -> None:

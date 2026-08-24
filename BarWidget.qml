@@ -43,6 +43,7 @@ BarWidget {
     ? Number(stats.wpm_last) : 0
   readonly property int navKeyboardCount: stats ? Number(stats.nav_keyboard || 0) : 0
   readonly property int navMouseCount: stats ? Number(stats.nav_mouse || 0) : 0
+  readonly property real mouseWeight: stats ? Number(stats.mouse_weight || 1.0) : 1.0
   readonly property var navKeyboardPct: stats ? stats.nav_keyboard_pct : null
   readonly property int cheatsheetCount: stats ? Number(stats.cheatsheet_count || 0) : 0
 
@@ -90,6 +91,7 @@ BarWidget {
         wpmLast: root.wpmLast
         navKeyboardCount: root.navKeyboardCount
         navMouseCount: root.navMouseCount
+        mouseWeight: root.mouseWeight
         cheatsheetCount: root.cheatsheetCount
       }
     }

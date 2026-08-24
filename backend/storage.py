@@ -14,6 +14,12 @@ from datetime import datetime, timedelta, timezone
 
 SCHEMA_VERSION = 1
 DEFAULT_RETENTION_DAYS = 90
+# Calibration knob for the keyboard/mouse split: each mouse nav event counts
+# as `mouse_weight` keyboard events when computing nav_keyboard_pct. 1.0 =
+# raw counts; >1 treats a mouse action as a bigger "keyboard avoidance";
+# <1 discounts mouse actions.
+DEFAULT_MOUSE_WEIGHT = 1.0
+MOUSE_WEIGHT_MIN, MOUSE_WEIGHT_MAX = 0.1, 10.0
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS typing_bursts (
@@ -82,6 +88,7 @@ class Storage:
         self._conn.executescript(_SCHEMA)
         self._ensure_meta("schema_version", str(SCHEMA_VERSION))
         self._ensure_meta("retention_days", str(DEFAULT_RETENTION_DAYS))
+        self._ensure_meta("mouse_weight", str(DEFAULT_MOUSE_WEIGHT))
         self._pending = _PendingWrites()
 
     def close(self) -> None:
@@ -97,6 +104,29 @@ class Storage:
         cur = self._conn.execute("SELECT value FROM meta WHERE key = 'retention_days'")
         row = cur.fetchone()
         return int(row[0]) if row else DEFAULT_RETENTION_DAYS
+
+    def mouse_weight(self) -> float:
+        """Calibration weight applied to mouse nav events in the split."""
+        cur = self._conn.execute("SELECT value FROM meta WHERE key = 'mouse_weight'")
+        row = cur.fetchone()
+        try:
+            weight = float(row[0]) if row else DEFAULT_MOUSE_WEIGHT
+        except (TypeError, ValueError):
+            weight = DEFAULT_MOUSE_WEIGHT
+        return min(max(weight, MOUSE_WEIGHT_MIN), MOUSE_WEIGHT_MAX)
+
+    def set_mouse_weight(self, weight: float) -> float:
+        """Persist a new calibration weight; returns the clamped value used."""
+        try:
+            weight = float(weight)
+        except (TypeError, ValueError):
+            raise ValueError(f"mouse_weight must be a number, got {weight!r}")
+        clamped = min(max(weight, MOUSE_WEIGHT_MIN), MOUSE_WEIGHT_MAX)
+        self._conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('mouse_weight', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (str(clamped),))
+        return clamped
 
     # -- queueing: the daemon appends here as events happen, and calls
     # flush() on a ~2s timer so writes are batched rather than per-event. --
@@ -224,6 +254,8 @@ class Storage:
 
         nav_total = nav_kb + nav_mouse
         has_data = bool(burst_count or nav_total or cheatsheet_count)
+        mouse_weight = self.mouse_weight()
+        nav_denominator = nav_kb + nav_mouse * mouse_weight
         return {
             "has_data": has_data,
             "window": window,
@@ -232,7 +264,9 @@ class Storage:
             "wpm_burst_count": burst_count,
             "nav_keyboard": nav_kb,
             "nav_mouse": nav_mouse,
-            "nav_keyboard_pct": round(100 * nav_kb / nav_total, 1) if nav_total else None,
+            "mouse_weight": mouse_weight,
+            "nav_keyboard_pct":
+                round(100 * nav_kb / nav_denominator, 1) if nav_denominator else None,
             "cheatsheet_count": cheatsheet_count,
         }
 

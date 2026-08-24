@@ -39,6 +39,7 @@ Panel {
   property real wpmLast: 0
   property int navKeyboardCount: 0
   property int navMouseCount: 0
+  property real mouseWeight: 1.0
   property int cheatsheetCount: 0
 
   KeyboardPanel {
@@ -101,7 +102,7 @@ Panel {
           }
           Text {
             width: parent.width
-            text: "Navigation: " + Fmt.formatNavBreakdown(root.navKeyboardCount, root.navMouseCount)
+            text: "Navigation: " + Fmt.formatNavBreakdown(root.navKeyboardCount, root.navMouseCount, root.mouseWeight)
             color: root.barForeground
             font.family: root.bar ? root.bar.fontFamily : Style.font.family
             wrapMode: Text.WordWrap
