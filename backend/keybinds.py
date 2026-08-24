@@ -3,12 +3,21 @@
 Not an Omarchy-documented convention -- we parse Hyprland's own JSON bind dump
 so mouse-vs-keyboard attribution stays correct if the user rebinds things in
 their own ~/.config/hypr/bindings.lua, rather than hardcoding default binds.
+
+Omarchy wrinkle: its lua config binds EVERYTHING through the `__lua`
+dispatcher (`hyprctl binds -j` shows dispatcher="__lua", arg="<n>" -- a
+handler index that hides the real dispatcher). So for __lua binds we match on
+the human-readable `description` field instead, which Omarchy populates with
+phrases like "Focus on left window". A __lua bind whose description matches no
+pattern is simply not allowlisted -- it falls back to "unattributed" rather
+than guessing.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import re
 
 from evdev import ecodes as e
 
@@ -17,6 +26,22 @@ NAV_DISPATCHERS = frozenset({
     "movefocus", "focuswindow", "focusmonitor", "focusurgentorlast",
     "cyclenext", "changegroupactive",
 })
+
+LUA_DISPATCHER = "__lua"
+
+# Description phrases used by Omarchy's own bindings.lua for nav dispatchers.
+# Kept anchored and narrow: a false "nav" here would misattribute real typing,
+# while a miss just costs us one unattributed episode.
+NAV_DESCRIPTION_PATTERNS = tuple(re.compile(p) for p in (
+    r"^Focus on (left|right|above|below) window$",   # movefocus
+    r"^Focus on (next|previous) monitor$",           # focusmonitor
+    r"^Focus on (next|previous) window$",            # cyclenext
+    r"^(Next|Previous) workspace$",                  # workspace cycling
+    r"^Former workspace$",                           # focusurgentorlast-style
+    r"^Switch to workspace \d+$",                    # workspace
+    r"^Move window( silently)? to workspace \d+$",   # movetoworkspace(silent)
+    r"^Move grouped window focus (left|right)$",     # changegroupactive
+))
 
 # Hyprland's own modmask bit values (SHIFT=1, CAPS=2, CTRL=4, ALT=8,
 # NUMLOCK=16, MOD3=32, SUPER=64, MOD5=128) -- confirmed against this
@@ -69,23 +94,58 @@ def parse_binds_json(raw: str) -> set[tuple[int, str]]:
         return set()
 
     allowlist: set[tuple[int, str]] = set()
+    # Keyless __lua nav binds (Omarchy's workspace digits come through as
+    # `code:N`, which `hyprctl binds -j` reports with an empty key). Their
+    # descriptions still identify them, and their layout is fixed by Omarchy,
+    # so we synthesize the digit key instead of losing the single most common
+    # keyboard navigation there is.
+    keyless_workspace_binds: list[tuple[int, int]] = []
     for bind in binds:
         if not isinstance(bind, dict):
             continue
         dispatcher = str(bind.get("dispatcher", ""))
-        if dispatcher not in NAV_DISPATCHERS:
-            continue
         key = str(bind.get("key", "")).strip()
-        if not key:
-            continue
         try:
             modmask = int(bind.get("modmask", 0))
         except (TypeError, ValueError):
             modmask = 0
         if modmask == 0:
             continue  # an un-modified nav bind can't be distinguished from typing
-        allowlist.add((modmask, key.upper()))
+
+        if not key:
+            if dispatcher == LUA_DISPATCHER and modmask and \
+                    (match := _workspace_number(bind.get("description"))):
+                keyless_workspace_binds.append((modmask, match))
+            continue
+
+        if dispatcher in NAV_DISPATCHERS:
+            allowlist.add((modmask, key.upper()))
+        elif dispatcher == LUA_DISPATCHER and _is_nav_description(bind.get("description")):
+            allowlist.add((modmask, key.upper()))
+
+    for modmask, workspace in keyless_workspace_binds:
+        allowlist.add((modmask, str(workspace % 10)))  # workspace 10 -> "0"
     return allowlist
+
+
+_WORKSPACE_NUMBER_RE = re.compile(
+    r"^(?:Switch to|Move window(?: silently)? to) workspace (\d+)$")
+
+
+def _workspace_number(description) -> int | None:
+    text = str(description or "").strip()
+    match = _WORKSPACE_NUMBER_RE.match(text)
+    if not match:
+        return None
+    workspace = int(match.group(1))
+    return workspace if 1 <= workspace <= 10 else None
+
+
+def _is_nav_description(description) -> bool:
+    text = str(description or "").strip()
+    if not text:
+        return False
+    return any(pattern.match(text) for pattern in NAV_DESCRIPTION_PATTERNS)
 
 
 class NavComboMatcher:
