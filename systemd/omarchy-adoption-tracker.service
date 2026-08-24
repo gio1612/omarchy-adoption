@@ -1,0 +1,20 @@
+[Unit]
+Description=Omarchy Adoption Tracker background metrics daemon
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/share/omarchy-adoption-tracker/venv/bin/python %h/.local/lib/omarchy-adoption-tracker/daemon.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=8
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/omarchy-adoption-tracker
+RuntimeDirectory=omarchy-adoption-tracker
+
+[Install]
+WantedBy=default.target
