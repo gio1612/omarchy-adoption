@@ -152,6 +152,8 @@ class Daemon:
         elif command == "stats":
             window = message.get("window", "today")
             result = response(request_id, True, self.storage.get_stats(window))
+        elif command == "records":
+            result = response(request_id, True, self.storage.get_records())
         elif command == "set_mouse_weight":
             try:
                 weight = self.storage.set_mouse_weight(message.get("value"))

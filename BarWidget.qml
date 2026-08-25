@@ -31,6 +31,7 @@ BarWidget {
   readonly property string windowKey: {
     var w = windowLabel.toLowerCase()
     if (w.indexOf("week") >= 0) return "week"
+    if (w.indexOf("month") >= 0) return "month"
     if (w.indexOf("all") >= 0) return "all"
     return "today"
   }
@@ -51,6 +52,7 @@ BarWidget {
     backend.connected, hasData, wpmAvg, navKeyboardPct, cheatsheetCount)
 
   onWindowKeyChanged: backend.requestStats(windowKey)
+  onOpenedChanged: if (opened) backend.requestRecords()
 
   BackendClient {
     id: backend
@@ -93,6 +95,7 @@ BarWidget {
         navMouseCount: root.navMouseCount
         mouseWeight: root.mouseWeight
         cheatsheetCount: root.cheatsheetCount
+        records: backend.lastRecords
       }
     }
   }

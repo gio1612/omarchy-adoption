@@ -16,6 +16,7 @@ Item {
   property bool wanted: true
   property string window: "today"
   property var lastStats: null
+  property var lastRecords: null
   property int reconnectAttempt: 0
 
   readonly property var activeSocket: socketLoader.item
@@ -58,6 +59,12 @@ Item {
         root.lastStats = result
         root.statsReceived(result)
       }
+    })
+  }
+
+  function requestRecords() {
+    sendCommand("records", null, function(ok, result) {
+      if (ok && result) root.lastRecords = result
     })
   }
 

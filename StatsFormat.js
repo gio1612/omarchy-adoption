@@ -16,8 +16,38 @@ function formatCompactLabel(connected, hasData, wpmAvg, navKeyboardPct, cheatshe
 
 function formatWindowLabel(windowKey) {
   if (windowKey === "week") return "This week"
+  if (windowKey === "month") return "This month"
   if (windowKey === "all") return "All-time"
   return "Today"
+}
+
+function _shortDay(day) {
+  if (!day) return ""
+  var months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+  var parts = String(day).split("-")
+  if (parts.length !== 3) return String(day)
+  return months[Number(parts[1]) - 1] + " " + Number(parts[2])
+}
+
+function recordLines(records) {
+  if (!records) return []
+  var lines = []
+  if (records.fastest_burst_wpm) {
+    lines.push("Fastest burst: " + Math.round(records.fastest_burst_wpm.value)
+               + " WPM · " + _shortDay(records.fastest_burst_wpm.day))
+  }
+  if (records.busiest_keystroke_day) {
+    lines.push("Most keystrokes in a day: "
+               + Number(records.busiest_keystroke_day.value).toLocaleString()
+               + " · " + _shortDay(records.busiest_keystroke_day.day))
+  }
+  if (records.best_keyboard_day) {
+    lines.push("Most keyboard-driven day: "
+               + Math.round(records.best_keyboard_day.value) + "% keyboard · "
+               + _shortDay(records.best_keyboard_day.day))
+  }
+  return lines
 }
 
 function formatNavBreakdown(navKeyboardCount, navMouseCount, mouseWeight) {

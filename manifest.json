@@ -15,7 +15,7 @@
     "defaultSection": "right",
     "defaults": { "window": "Today" },
     "schema": [
-      { "key": "window", "type": "string", "label": "Display window (Today / This week / All-time)" }
+      { "key": "window", "type": "string", "label": "Display window (Today / This week / This month / All-time)" }
     ]
   }
 }

@@ -71,6 +71,23 @@ echo '{"v":1,"id":1,"command":"set_mouse_weight","value":2.0}' | \
 Values are clamped to `[0.1, 10.0]`. Only the *percentage* is weighted —
 raw counts are always reported unweighted.
 
+## Stats windows & records
+
+The widget's `window` setting selects the displayed range: **Today**,
+**This week** (last 7 days), **This month** (last 30 days), or **All-time**.
+Today's numbers reset at local midnight by construction.
+
+Because each day resets, the panel also keeps a **Best of the best** list of
+all-time personal bests:
+
+- Fastest typing burst (WPM) and when it happened
+- Most keystrokes in a single day
+- Most keyboard-driven day (highest keyboard nav %, among days with at least
+  20 navigation events so a 2-event day can't top the board)
+
+Records use raw unweighted counts, so they stay stable if you later change
+the calibration weight.
+
 ## How it works (brief)
 
 A small Python daemon (`backend/daemon.py`, installed by `setup.sh`) reads

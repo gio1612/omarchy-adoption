@@ -1,5 +1,6 @@
 import os
 import time
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -140,3 +141,66 @@ def test_all_window_aggregates_across_days(tmp_path):
     today_stats = store.get_stats("today")
     assert today_stats["wpm_burst_count"] == 1
     store.close()
+
+
+def test_month_window_covers_30_days(tmp_path):
+    store = make_storage(tmp_path)
+    now = time.time()
+    in_month = now - 10 * 86400
+    out_of_month = now - 45 * 86400
+    for ts in (in_month, out_of_month):
+        store.queue_cheatsheet_invocation(ts)
+    store.flush()
+    assert store.get_stats("month")["cheatsheet_count"] == 1
+    assert store.get_stats("week")["cheatsheet_count"] == 0
+    assert store.get_stats("all")["cheatsheet_count"] == 2
+    # month window really spans 30 distinct days
+    assert len(store._window_days("month")) == 30
+    store.close()
+
+
+def test_records_empty_database(tmp_path):
+    store = make_storage(tmp_path)
+    assert store.get_records() == {}
+    store.close()
+
+
+def test_records_personal_bests(tmp_path):
+    store = make_storage(tmp_path)
+
+    def ts_for(day_ago, hour=12):
+        d = datetime.now().astimezone() - timedelta(days=day_ago)
+        return d.replace(hour=hour, minute=0, second=0, microsecond=0).timestamp()
+
+    # typing: a 40 WPM day and a later record 80 WPM burst
+    store.queue_typing_burst(TypingBurst(ended_at=ts_for(5), duration_ms=10000,
+                                         keystroke_count=100, wpm=40.0))
+    store.queue_typing_burst(TypingBurst(ended_at=ts_for(1), duration_ms=10000,
+                                          keystroke_count=200, wpm=80.0))
+    # nav: yesterday is keyboard-heavy with enough volume; two days ago is
+    # higher-pct but under the volume threshold -- must NOT win the record
+    store.queue_nav_event("mouse", ts_for(5, 9))
+    for _ in range(19):
+        store.queue_nav_event("keyboard", ts_for(5, 10))
+    for _ in range(30):
+        store.queue_nav_event("keyboard", ts_for(1, 9))
+    store.queue_nav_event("mouse", ts_for(1, 10))
+    store.flush()
+
+    records = store.get_records()
+    assert records["fastest_burst_wpm"]["value"] == 80.0
+    assert records["fastest_burst_wpm"]["day"] == _day_str(1)
+
+    busiest = records["busiest_keystroke_day"]
+    assert busiest["value"] == 200
+    assert busiest["day"] == _day_str(1)
+
+    best_kb = records["best_keyboard_day"]
+    # only the >=20-event day qualifies: 30/31 keyboard
+    assert best_kb["value"] == pytest.approx(96.8, rel=0.01)
+    assert best_kb["day"] == _day_str(1)
+    store.close()
+
+
+def _day_str(days_ago):
+    return (datetime.now().astimezone() - timedelta(days=days_ago)).strftime("%Y-%m-%d")

@@ -41,6 +41,7 @@ Panel {
   property int navMouseCount: 0
   property real mouseWeight: 1.0
   property int cheatsheetCount: 0
+  property var records: null
 
   KeyboardPanel {
     id: keyboardPanel
@@ -113,6 +114,31 @@ Panel {
             color: root.barForeground
             font.family: root.bar ? root.bar.fontFamily : Style.font.family
             wrapMode: Text.WordWrap
+          }
+        }
+
+        Column {
+          width: parent.width
+          visible: root.connectedToDaemon && Fmt.recordLines(root.records).length > 0
+          spacing: Style.space(4)
+
+          Text {
+            width: parent.width
+            text: "Best of the best"
+            color: root.barForeground
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.bold: true
+          }
+          Repeater {
+            model: Fmt.recordLines(root.records)
+            Text {
+              required property string modelData
+              width: parent.width
+              text: modelData
+              color: root.barForeground
+              font.family: root.bar ? root.bar.fontFamily : Style.font.family
+              wrapMode: Text.WordWrap
+            }
           }
         }
       }

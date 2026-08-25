@@ -20,6 +20,10 @@ DEFAULT_RETENTION_DAYS = 90
 # <1 discounts mouse actions.
 DEFAULT_MOUSE_WEIGHT = 1.0
 MOUSE_WEIGHT_MIN, MOUSE_WEIGHT_MAX = 0.1, 10.0
+# A day needs at least this many raw nav events before its keyboard split can
+# become the "best keyboard day" record -- otherwise a 2-event day tops the
+# board by luck.
+RECORD_MIN_NAV_DAY = 20
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS typing_bursts (
@@ -220,10 +224,12 @@ class Storage:
         today = datetime.now().astimezone().date()
         if window == "today":
             return [today.strftime("%Y-%m-%d")]
-        return [(today - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
+        span = 30 if window == "month" else 7
+        return [(today - timedelta(days=i)).strftime("%Y-%m-%d")
+                for i in range(span)]
 
     def get_stats(self, window: str) -> dict:
-        window = window if window in ("today", "week", "all") else "today"
+        window = window if window in ("today", "week", "month", "all") else "today"
 
         if window == "all":
             burst_count, nav_kb, nav_mouse, cheatsheet_count = self._conn.execute(
@@ -278,3 +284,37 @@ class Storage:
         self._conn.execute(
             "DELETE FROM cheatsheet_invocations WHERE occurred_at < ?", (cutoff,))
         self._conn.execute("VACUUM")
+
+    def get_records(self) -> dict:
+        """All-time personal bests ('best of the best' KPIs). Daily stats
+        reset by construction -- these survive so a great day is never lost.
+        Computed on demand; the dataset (90-day retention) stays tiny."""
+        records: dict[str, dict] = {}
+
+        row = self._conn.execute(
+            "SELECT wpm, ended_at FROM typing_bursts ORDER BY wpm DESC LIMIT 1"
+        ).fetchone()
+        if row:
+            records["fastest_burst_wpm"] = {
+                "value": round(row[0], 1), "day": _day_key(row[1])}
+
+        row = self._conn.execute(
+            "SELECT day, typing_keystroke_total FROM daily_rollup "
+            "WHERE typing_keystroke_total > 0 "
+            "ORDER BY typing_keystroke_total DESC LIMIT 1").fetchone()
+        if row:
+            records["busiest_keystroke_day"] = {
+                "value": row[1], "day": row[0]}
+
+        row = self._conn.execute(
+            "SELECT day, nav_keyboard_count, nav_mouse_count FROM daily_rollup "
+            "WHERE nav_keyboard_count + nav_mouse_count >= ? "
+            "ORDER BY CAST(nav_keyboard_count AS REAL) / "
+            "(nav_keyboard_count + nav_mouse_count) DESC LIMIT 1",
+            (RECORD_MIN_NAV_DAY,)).fetchone()
+        if row:
+            day, kb, mouse = row
+            records["best_keyboard_day"] = {
+                "value": round(100 * kb / (kb + mouse), 1), "day": day}
+
+        return records
