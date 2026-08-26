@@ -1,6 +1,5 @@
 import QtQuick
 import Quickshell
-import qs.Commons
 import qs.Ui
 
 import "StatsFormat.js" as Fmt
@@ -59,22 +58,24 @@ BarWidget {
     window: root.windowKey
   }
 
-  implicitWidth: label.implicitWidth + Style.space(16)
-  implicitHeight: root.barSize
+  implicitWidth: button.implicitWidth
+  implicitHeight: button.implicitHeight
 
-  Text {
-    id: label
-    anchors.centerIn: parent
-    text: root.compactLabel
-    color: root.bar ? root.bar.barForeground : Color.foreground
-    font.family: root.bar ? root.bar.fontFamily : Style.font.family
-    font.pixelSize: Style.font.body
-    elide: Text.ElideRight
-  }
-
-  MouseArea {
+  // A bare MouseArea is not reliably clickable here: the bar's own
+  // per-slot MouseArea (drag-to-reorder) sits on top of every widget and
+  // only forwards presses to a target that exposes triggerPress() (either
+  // self-registered via WidgetButton, or exposed on the slot's activeItem
+  // directly) -- see Bar.qml's moduleClickTargetAt/pressModuleClickTarget.
+  // Every other first- and third-party bar widget uses WidgetButton for
+  // exactly this reason.
+  WidgetButton {
+    id: button
     anchors.fill: parent
-    onClicked: root.toggle()
+    bar: root.bar
+    text: root.compactLabel
+    hasVisualContent: text !== ""
+
+    onPressed: function(b) { if (b === Qt.LeftButton) root.toggle() }
   }
 
   Loader {
