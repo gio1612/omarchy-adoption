@@ -276,6 +276,45 @@ class Storage:
             "cheatsheet_count": cheatsheet_count,
         }
 
+    def get_daily_history(self, days: int = 14) -> dict:
+        """Per-day trend series for the trailing `days` calendar days
+        (including today), oldest first. Read-only projection over
+        daily_rollup -- no new writes. Days with no daemon activity that day
+        come back as zeroed/null rows rather than being omitted, so callers
+        can always zip the series against a fixed-length day axis."""
+        days = max(1, min(int(days) if days else 14, self.retention_days()))
+        today = datetime.now().astimezone().date()
+        day_keys = [(today - timedelta(days=i)).strftime("%Y-%m-%d")
+                    for i in range(days - 1, -1, -1)]  # oldest -> newest
+        placeholders = ",".join("?" for _ in day_keys)
+        rows = {r[0]: r for r in self._conn.execute(
+            f"SELECT day, typing_wpm_avg, typing_burst_count, nav_keyboard_count, "
+            f"nav_mouse_count, cheatsheet_count FROM daily_rollup "
+            f"WHERE day IN ({placeholders})", day_keys).fetchall()}
+        mouse_weight = self.mouse_weight()
+        series = []
+        for day in day_keys:
+            row = rows.get(day)
+            if row is None:
+                series.append({
+                    "day": day, "wpm_avg": None, "burst_count": 0,
+                    "nav_keyboard": 0, "nav_mouse": 0, "nav_keyboard_pct": None,
+                    "cheatsheet_count": 0,
+                })
+                continue
+            _, wpm_avg, burst_count, nav_kb, nav_mouse, cheatsheet_count = row
+            denom = nav_kb + nav_mouse * mouse_weight
+            series.append({
+                "day": day,
+                "wpm_avg": round(wpm_avg, 1) if wpm_avg is not None else None,
+                "burst_count": burst_count,
+                "nav_keyboard": nav_kb,
+                "nav_mouse": nav_mouse,
+                "nav_keyboard_pct": round(100 * nav_kb / denom, 1) if denom else None,
+                "cheatsheet_count": cheatsheet_count,
+            })
+        return {"days": days, "mouse_weight": mouse_weight, "series": series}
+
     def prune_old_data(self, retention_days: int | None = None) -> None:
         retention_days = retention_days if retention_days is not None else self.retention_days()
         cutoff = time.time() - retention_days * 86400

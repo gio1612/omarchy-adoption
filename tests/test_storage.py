@@ -204,3 +204,94 @@ def test_records_personal_bests(tmp_path):
 
 def _day_str(days_ago):
     return (datetime.now().astimezone() - timedelta(days=days_ago)).strftime("%Y-%m-%d")
+
+
+def test_daily_history_empty_db_returns_zeroed_series(tmp_path):
+    store = make_storage(tmp_path)
+    history = store.get_daily_history(14)
+    assert history["days"] == 14
+    assert history["mouse_weight"] == 1.0
+    assert len(history["series"]) == 14
+    # oldest first, today last
+    assert history["series"][-1]["day"] == _day_str(0)
+    assert history["series"][0]["day"] == _day_str(13)
+    for day in history["series"]:
+        assert day["wpm_avg"] is None
+        assert day["burst_count"] == 0
+        assert day["nav_keyboard"] == 0
+        assert day["nav_mouse"] == 0
+        assert day["nav_keyboard_pct"] is None
+        assert day["cheatsheet_count"] == 0
+    store.close()
+
+
+def test_daily_history_clamps_days_into_retention(tmp_path):
+    store = make_storage(tmp_path)
+    # 0 is falsy, same "not really specified" bucket as None -- defaults to 14
+    assert len(store.get_daily_history(0)["series"]) == 14
+    assert len(store.get_daily_history(-5)["series"]) == 1
+    assert len(store.get_daily_history(9999)["series"]) == store.retention_days()
+    assert store.get_daily_history(None)["days"] == 14
+    store.close()
+
+
+def test_daily_history_reflects_touched_days(tmp_path):
+    store = make_storage(tmp_path)
+
+    def ts_for(day_ago, hour=12):
+        d = datetime.now().astimezone() - timedelta(days=day_ago)
+        return d.replace(hour=hour, minute=0, second=0, microsecond=0).timestamp()
+
+    store.queue_typing_burst(TypingBurst(ended_at=ts_for(2), duration_ms=10000,
+                                          keystroke_count=100, wpm=72.0))
+    store.queue_nav_event("keyboard", ts_for(2, 9))
+    store.queue_nav_event("keyboard", ts_for(2, 9))
+    store.queue_nav_event("mouse", ts_for(2, 9))
+    store.queue_cheatsheet_invocation(ts_for(2))
+    store.flush()
+
+    history = store.get_daily_history(14)
+    by_day = {row["day"]: row for row in history["series"]}
+    today_row = by_day[_day_str(2)]
+    assert today_row["wpm_avg"] == 72.0
+    assert today_row["burst_count"] == 1
+    assert today_row["nav_keyboard"] == 2
+    assert today_row["nav_mouse"] == 1
+    assert today_row["nav_keyboard_pct"] == pytest.approx(66.7, rel=0.01)
+    assert today_row["cheatsheet_count"] == 1
+
+    # an untouched day in the window stays a zeroed/null row
+    untouched = by_day[_day_str(5)]
+    assert untouched["wpm_avg"] is None
+    assert untouched["nav_keyboard_pct"] is None
+    store.close()
+
+
+def test_daily_history_uses_mouse_weight(tmp_path):
+    store = make_storage(tmp_path)
+    now = time.time()
+    store.queue_nav_event("keyboard", now)
+    store.queue_nav_event("keyboard", now)
+    store.queue_nav_event("mouse", now)
+    store.flush()
+    store.set_mouse_weight(2.0)
+
+    history = store.get_daily_history(7)
+    assert history["mouse_weight"] == 2.0
+    today_row = history["series"][-1]
+    # pct = 2 / (2 + 1*2) = 50%, matching get_stats' weighted calculation
+    assert today_row["nav_keyboard_pct"] == 50.0
+    store.close()
+
+
+def test_daily_history_no_nav_events_leaves_pct_null(tmp_path):
+    store = make_storage(tmp_path)
+    store.queue_cheatsheet_invocation(time.time())
+    store.flush()
+    history = store.get_daily_history(3)
+    today_row = history["series"][-1]
+    assert today_row["nav_keyboard"] == 0
+    assert today_row["nav_mouse"] == 0
+    assert today_row["nav_keyboard_pct"] is None
+    assert today_row["cheatsheet_count"] == 1
+    store.close()

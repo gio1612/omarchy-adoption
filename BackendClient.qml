@@ -17,6 +17,7 @@ Item {
   property string window: "today"
   property var lastStats: null
   property var lastRecords: null
+  property var lastHistory: null
   property int reconnectAttempt: 0
 
   readonly property var activeSocket: socketLoader.item
@@ -31,6 +32,7 @@ Item {
   }
 
   signal statsReceived(var stats)
+  signal historyReceived(var history)
 
   function sendCommand(name, fields, callback) {
     var socket = activeSocket
@@ -65,6 +67,15 @@ Item {
   function requestRecords() {
     sendCommand("records", null, function(ok, result) {
       if (ok && result) root.lastRecords = result
+    })
+  }
+
+  function requestHistory(days) {
+    sendCommand("history", { days: days || 14 }, function(ok, result) {
+      if (ok && result) {
+        root.lastHistory = result
+        root.historyReceived(result)
+      }
     })
   }
 

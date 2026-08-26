@@ -48,10 +48,13 @@ BarWidget {
   readonly property int cheatsheetCount: stats ? Number(stats.cheatsheet_count || 0) : 0
 
   readonly property string compactLabel: Fmt.formatCompactLabel(
-    backend.connected, hasData, wpmAvg, navKeyboardPct, cheatsheetCount)
+    backend.connected, hasData, wpmAvg, navKeyboardPct)
 
   onWindowKeyChanged: backend.requestStats(windowKey)
-  onOpenedChanged: if (opened) backend.requestRecords()
+  onOpenedChanged: if (opened) {
+    backend.requestRecords()
+    backend.requestHistory(14)
+  }
 
   BackendClient {
     id: backend
@@ -95,8 +98,10 @@ BarWidget {
         navKeyboardCount: root.navKeyboardCount
         navMouseCount: root.navMouseCount
         mouseWeight: root.mouseWeight
+        navKeyboardPct: root.navKeyboardPct
         cheatsheetCount: root.cheatsheetCount
         records: backend.lastRecords
+        history: backend.lastHistory
       }
     }
   }
