@@ -29,9 +29,14 @@ You implement changes for a real, currently-working Omarchy (Hyprland/Quickshell
 ## Verification (you must do this yourself, not just claim it)
 
 1. If you touched `backend/*.py`: run `python3 -m pytest` from the repo root (see `conftest.py`/`tests/requirements.txt`) and confirm everything passes, including your new tests.
-2. Copy every file you changed into the *installed* live plugin locations so the running instances pick them up:
-   - QML/JS: `cp BarWidget.qml StatsPanel.qml StatsFormat.js ~/.config/omarchy/plugins/io.github.gio1612.omarchy-adoption/` (Quickshell hot-reloads these).
-   - Backend, if changed: `cp backend/*.py ~/.local/lib/omarchy-adoption-tracker/ && systemctl --user restart omarchy-adoption-tracker.service` (the daemon does NOT hot-reload — you must restart it, then confirm with `systemctl --user is-active omarchy-adoption-tracker.service` that it's active, not crash-looping).
+2. Copy every file you changed into the *installed* live plugin locations so the running instances pick them up. **Use the deploy script — it does all three copies, restarts the daemon, and reloads the shell in one command:**
+   ```sh
+   bash scripts/deploy.sh          # full deploy
+   bash scripts/deploy.sh --no-shell  # deploy but skip the shell reload
+   bash scripts/deploy.sh --dry-run   # preview what would be copied
+   ```
+   Under the hood `deploy.sh` syncs: root `*.qml`/`*.js`/`manifest.json` → `~/.config/omarchy/plugins/io.github.gio1612.omarchy-adoption/` (Quickshell hot-reloads these), and `backend/*.py` → BOTH the plugin dir `backend/` and the daemon runtime `~/.local/lib/omarchy-adoption-tracker/` (the daemon does NOT hot-reload — the script restarts it, then confirm with `systemctl --user is-active omarchy-adoption-tracker.service` that it's active, not crash-looping).<br>
+   The plugin has THREE copies — never edit the plugin dir or `~/.local/lib/omarchy-adoption-tracker/` directly, and never hand-`cp` files when `scripts/deploy.sh` exists. Always develop in this repo and deploy with the script.
 3. Wait a couple seconds, then check the shell picked up the QML cleanly with no QML errors:
    `journalctl --user -b --no-pager --since "-30 seconds" | grep -i "omarchy-shell"` — look for `Local plugin changed, reloading: io.github.gio1612.omarchy-adoption` with no `Error`/`error` lines pointing at this plugin's own files afterward. Duplicate-`IpcHandler`-registration warnings on *other* plugins' files during a full shell reload are normal noise, not your bug.
    If you changed the backend, also check `journalctl --user -u omarchy-adoption-tracker.service -n 20 --no-pager` for a clean restart with no tracebacks.
