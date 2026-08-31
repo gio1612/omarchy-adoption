@@ -952,3 +952,929 @@ read-only nature.
   memorable events, not a series; charting one point per record would be
   exactly the "plain numbers wearing a shape" problem the feedback called
   out. They stay leaderboard cards, unchanged by this revision.
+
+## App-launch: keybind vs. panel
+
+New metric, spec-only addendum (companion to the "Revision — trends, titles,
+minimalism" work above; same house style, same rigor). Answers a third
+adoption question alongside "keyboard vs. mouse for navigation" and "typing
+speed": **when the user opens an application, do they reach for a direct
+keybind, or do they go through Omarchy's app panel (SUPER+SPACE / SUPER+ALT+
+SPACE)?** A direct-bind habit is the deeper mastery signal this whole plugin
+exists to encourage; the panel is the "still building muscle memory" path.
+Same accent language applies: the keybind share is drawn in `Color.accent`
+("the good direction"), the panel share in muted `barForeground` alpha —
+identical grammar to the keyboard/mouse nav split, just a second axis.
+
+### Ground truth this section is built on
+
+Verified live on this machine (`hyprctl binds -j`) and against the installed
+shell's own source, not assumed:
+
+- Omarchy wraps every bind through a `__lua` dispatcher with an opaque
+  `arg` handler index — same wrinkle `keybinds.py` already documents for
+  nav. The only usable signal for a `__lua` bind is its human-readable
+  `description`.
+- App-launch binds are a long, open-ended, effectively-proper-noun list:
+  `64 RETURN "Terminal"`, `65 RETURN "Browser"`, `65 F "File manager"`,
+  `73 F "File manager (cwd)"`, `65 B "Browser"`, `73 B "Browser (private)"`,
+  `65 N "Editor"`, `72 RETURN "Tmux"`, `68 RETURN "Herdr"`, `65 M "Music"`,
+  `73 M "Music TUI"`, `65 D "Docker"`, `65 G "Signal"`, `65 O "Obsidian"`,
+  `65 W "Omawrite"`, `65 SLASH "Passwords"`, `65 A "ChatGPT"`,
+  `73 A "Grok"`, `65 C "Calendar"`, `65 E "Email"`, `73 E "New email"`,
+  `65 Y "YouTube"`, `73 G "WhatsApp"`, `69 G "Google Messages"`,
+  `65 P "Google Photos"`, `65 S "Google Maps"`, `65 X "X"`, `73 X "X Post"`.
+  Unlike nav's fixed phrasing template ("Focus on left window"), these
+  share no common sentence shape — they are literally the app's name — so
+  a regex-pattern allowlist (nav's approach) doesn't apply; a **literal
+  description allowlist** is the only workable signal (see decision 1).
+- The two bar-real-estate app-entry points the user named are both real,
+  distinct binds: `64 SPACE "Omarchy menu"` (SUPER+SPACE, a root menu —
+  apps plus system actions like Lock/Power) and `72 SPACE "Apps menu"`
+  (SUPER+ALT+SPACE, dedicated app launcher).
+- Confirmed by reading `/usr/share/omarchy/shell/plugins/menu/Menu.qml`:
+  Omarchy's app panel is a **Quickshell-native overlay**, not a separate
+  Hyprland client window (no `walker`/`rofi`/`fuzzel` process, nothing in
+  `hyprctl clients -j` for it). This matters directly for decision 2 below:
+  there is no launcher window to filter out of `openwindow>>` correlation.
+- `hypr_ipc.py`'s `_read_loop` already reads every socket2 line but only
+  forwards `NAV_EVENT_PREFIXES` and `configreloaded>>`; `openwindow>>`
+  lines (format `openwindow>>ADDRESS,WORKSPACE,CLASS,TITLE`) are read and
+  silently dropped today. New plumbing is required to use them.
+
+### Key design decisions
+
+**1. Detection: a curated literal-description allowlist, not a pattern.**
+Add `APP_LAUNCH_DESCRIPTIONS` (a `frozenset[str]`, exact strings from the
+list above) and `PANEL_LAUNCH_DESCRIPTIONS = frozenset({"Omarchy menu",
+"Apps menu"})` to `backend/keybinds.py`, parsed from live `hyprctl binds
+-j` output exactly like `NAV_DESCRIPTION_PATTERNS` — same file, same
+"live, not hardcoded modmask/key" philosophy, just literal-string matching
+instead of regex (there is no shared phrase template to anchor a regex
+to). Explicitly **not exhaustive by design**, mirroring `keybinds.py`'s own
+docstring: this list is seeded from Omarchy's first-party default
+`bindings.lua`, so a user's own custom app-launch bind in their personal
+`~/.config/hypr/bindings.lua` is *not* tracked unless its description
+happens to match one of these exact strings. A `__lua` bind whose
+description matches neither `APP_LAUNCH_DESCRIPTIONS` nor
+`PANEL_LAUNCH_DESCRIPTIONS` is simply never armed — it falls back to
+unattributed, never guessed, same posture as nav. Utility/system-toggle
+binds that also "open something" in a loose sense (Calculator, Weather,
+Reminders, Screenshot, Background switcher, Theme menu, System menu,
+Power menu, notification history, etc.) are **deliberately excluded** from
+`APP_LAUNCH_DESCRIPTIONS` — this metric is about *applications*, not every
+keybind that pops a window; drawing that line via a curated allowlist
+(explicit inclusion) rather than a denylist (explicit exclusion) is safer
+by construction, matching nav's existing allowlist philosophy: an
+ambiguous new Omarchy bind added in a future release is unattributed by
+default, not silently swept into either bucket.
+
+**2. Attribution timing: correlate against a real `openwindow>>` event, not
+the keypress alone.** Keypress-only counting is fine for the cheatsheet:
+SUPER+K is a complete interaction -- the press itself renders the panel, so
+the keypress *is* the invocation, counted straight off the evdev stream
+against the live `hyprctl binds` allowlist (the cheatsheet's description
+bucket). No Hyprland keybind is ever rewritten to do that. This does not
+generalize to app launches, for two independent reasons, both decisive on
+their own:
+  - A bind wrapper that rewrites the tracked key doesn't scale: one wrapper
+    per tracked app-launch bind (26+ binds, an open-ended, user-editable
+    list) directly contradicts the "read live binds, don't hardcode a
+    fixed script per key" philosophy this whole plugin already commits to
+    for nav.
+  - It cannot represent the panel bucket at all: pressing SUPER+SPACE or
+    SUPER+ALT+SPACE only *opens the menu*. The actual launch happens an
+    unbounded, variable number of seconds later, when the user picks an
+    entry (mouse click or Enter after typing a filter) — an event this
+    daemon has no keybind to intercept.
+
+  Both problems point to the same fix: arm a channel on keypress, then
+  wait for Hyprland's own `openwindow>>` event (fired only when a brand
+  new top-level client is created — unlike `activewindow>>`, which also
+  fires on ordinary focus switches between already-open windows) to
+  confirm something was actually *launched*, not merely focused. This is
+  strictly more honest than keypress-only counting: pressing an
+  app-launch bind for an already-running app (which just focuses the
+  existing window, no new client) correctly produces **no** count in
+  either bucket — matching the metric's literal definition ("how many
+  apps they *launch*"), and matching the existing "don't fabricate, hide
+  rather than guess" posture applied elsewhere in this codebase. The
+  trade-off: it needs new IPC plumbing (`hypr_ipc.py` forwarding
+  `openwindow>>`) and a timing-correlation heuristic (§ below), with the
+  same category of known/accepted imprecision `nav_attrib.py`'s docstring
+  already documents for nav (an unrelated near-simultaneous window open
+  can be misattributed) — an acceptable trade-off for a personal adoption
+  metric, same standard this codebase already holds itself to.
+
+**3. SUPER+SPACE and SUPER+ALT+SPACE: both included, one shared "panel"
+bucket.** The user named both explicitly, so both are in scope per the
+brief's own default. They are **not** split into two sub-buckets: there is
+no meaningfully different user-facing story between "went through the root
+menu" and "went through the dedicated launcher" — both represent "browsed
+instead of using a direct shortcut," and a three-way keybind/root-menu/
+apps-menu visualization would dilute the one binary story ("shortcut vs.
+browse") this metric exists to tell, for no proportional payoff. The
+concern that SUPER+SPACE is a *root* menu (Lock, Power, and other
+non-app actions live there too, not just apps) is resolved by decision 2,
+not by excluding the bind: picking "Lock screen" from that menu produces
+no `openwindow>>` event, so it produces no panel-launch count at all —
+the correlation step itself filters out the non-app-launch paths through
+that menu, for free, without needing to special-case menu entries.
+
+**4. Non-launch binds (nav, system toggles, unmatched `__lua` presses,
+unmatched user binds) never arm either channel, ever.** They are simply
+never fed to `note_keybind_press`/`note_panel_press` at all — not
+misclassified, not counted as a third "other" bucket, not surfaced
+anywhere. An `openwindow>>` event with no live armed channel (e.g. an app
+spawns a second window on its own, or the user ran something from a
+terminal, or clicked a dock/taskbar icon this plugin doesn't have) is
+correctly attributed to neither bucket. Same "hide rather than fabricate"
+posture as nav's unmatched combos.
+
+### Backend data contract
+
+#### `backend/keybinds.py`
+
+Add the two new constants (exact set from "Ground truth" above):
+
+```python
+# Omarchy's first-party default app-launch bind descriptions (bindings.lua).
+# Seeded from a live default install -- NOT exhaustive by design (a user's
+# own custom app-launch bind in ~/.config/hypr/bindings.lua isn't tracked
+# unless its description happens to match one of these exact strings). A
+# __lua bind whose description matches neither this set nor
+# PANEL_LAUNCH_DESCRIPTIONS is simply not allowlisted -- unattributed, not
+# guessed, same posture as NAV_DESCRIPTION_PATTERNS above.
+APP_LAUNCH_DESCRIPTIONS = frozenset({
+    "Terminal", "Browser", "Browser (private)", "File manager",
+    "File manager (cwd)", "Editor", "Tmux", "Herdr", "Music", "Music TUI",
+    "Docker", "Signal", "Obsidian", "Omawrite", "Passwords", "ChatGPT",
+    "Grok", "Calendar", "Email", "New email", "YouTube", "WhatsApp",
+    "Google Messages", "Google Photos", "Google Maps", "X", "X Post",
+})
+
+# Omarchy's app-entry-point menu binds. Both included in one shared
+# "panel" bucket -- see DESIGN.md "App-launch: keybind vs. panel", decision
+# 3, for why SUPER+SPACE (a root menu, not exclusively an app launcher) is
+# still included rather than excluded or split out.
+PANEL_LAUNCH_DESCRIPTIONS = frozenset({"Omarchy menu", "Apps menu"})
+```
+
+Extend `parse_binds_json` to compute all three allowlists in the same
+single pass over the JSON it already parses, returning a dict instead of a
+bare set:
+
+```python
+def parse_binds_json(raw: str) -> dict[str, set[tuple[int, str]]]:
+    """Returns {"nav": ..., "app_launch": ..., "panel_launch": ...}, each a
+    set of (modmask, KEY) pairs. Breaking return-type change from the
+    previous bare-set return -- update callers (daemon.py) and
+    tests/test_keybinds.py accordingly."""
+    result = {"nav": set(), "app_launch": set(), "panel_launch": set()}
+    try:
+        binds = json.loads(raw)
+    except json.JSONDecodeError:
+        return result
+    if not isinstance(binds, list):
+        return result
+
+    keyless_workspace_binds: list[tuple[int, int]] = []
+    for bind in binds:
+        if not isinstance(bind, dict):
+            continue
+        dispatcher = str(bind.get("dispatcher", ""))
+        key = str(bind.get("key", "")).strip()
+        description = str(bind.get("description") or "").strip()
+        try:
+            modmask = int(bind.get("modmask", 0))
+        except (TypeError, ValueError):
+            modmask = 0
+        if modmask == 0:
+            continue
+
+        if not key:
+            if dispatcher == LUA_DISPATCHER and modmask and \
+                    (match := _workspace_number(description)):
+                keyless_workspace_binds.append((modmask, match))
+            continue
+
+        combo = (modmask, key.upper())
+        if dispatcher in NAV_DISPATCHERS:
+            result["nav"].add(combo)
+        elif dispatcher == LUA_DISPATCHER and _is_nav_description(description):
+            result["nav"].add(combo)
+        elif dispatcher == LUA_DISPATCHER and description in APP_LAUNCH_DESCRIPTIONS:
+            result["app_launch"].add(combo)
+        elif dispatcher == LUA_DISPATCHER and description in PANEL_LAUNCH_DESCRIPTIONS:
+            result["panel_launch"].add(combo)
+        # first match wins, checked nav -> app_launch -> panel_launch;
+        # defensive only -- the three sources are disjoint by construction.
+
+    for modmask, workspace in keyless_workspace_binds:
+        result["nav"].add((modmask, str(workspace % 10)))
+    return result
+```
+
+Rename `fetch_nav_allowlist()` to `fetch_keybind_allowlists()` (same body,
+just returns `parse_binds_json`'s dict directly) — the old name no longer
+describes what it fetches.
+
+Extend `NavComboMatcher` with two more allowlists and matcher methods,
+reusing its existing shared modifier-state tracking rather than
+duplicating it in a second class instance:
+
+```python
+class NavComboMatcher:
+    def __init__(self) -> None:
+        self._allowlist: set[tuple[int, str]] = set()
+        self._app_launch_allowlist: set[tuple[int, str]] = set()
+        self._panel_launch_allowlist: set[tuple[int, str]] = set()
+        # ... existing _held_* fields unchanged ...
+
+    def update_app_launch_allowlist(self, allowlist: set[tuple[int, str]]) -> None:
+        self._app_launch_allowlist = {(mask, key.upper()) for mask, key in allowlist}
+
+    def update_panel_launch_allowlist(self, allowlist: set[tuple[int, str]]) -> None:
+        self._panel_launch_allowlist = {(mask, key.upper()) for mask, key in allowlist}
+
+    def matches_app_launch(self, code: int) -> bool:
+        return self._matches_against(self._app_launch_allowlist, code)
+
+    def matches_panel_launch(self, code: int) -> bool:
+        return self._matches_against(self._panel_launch_allowlist, code)
+
+    def _matches_against(self, allowlist: set[tuple[int, str]], code: int) -> bool:
+        modmask = self.current_modmask
+        if modmask == 0:
+            return False
+        name = EVDEV_TO_HYPR_KEYNAME.get(code)
+        if name is None:
+            return False
+        return (modmask, name) in allowlist
+```
+
+(Refactor the existing `matches()` to also call `_matches_against(self._allowlist,
+code)` — same behavior, less duplication.) Update the class's module
+docstring to note it now serves three purposes (nav / app-launch / panel-
+launch detection), not just nav. Class name kept as `NavComboMatcher` to
+minimize diff size — a rename is not required for this addendum.
+
+#### `backend/hypr_ipc.py`
+
+Add a fourth event channel. `openwindow>>` carries window class/title in
+its payload, but this daemon **deliberately never parses that** — parsing
+only "did this line arrive," never its contents, extends the existing "no
+raw content, only aggregates" privacy stance to app identity too (see
+"Considered and rejected" below):
+
+```python
+OPENWINDOW_EVENT_PREFIX = "openwindow>>"
+```
+
+`HyprSocketClient.__init__` gains a new required callback:
+
+```python
+def __init__(self, on_nav_event, on_config_reloaded, on_openwindow_event):
+    ...
+    self._on_openwindow_event = on_openwindow_event
+```
+
+`_read_loop` gains one more branch (order matters only for readability;
+`openwindow>>` and `NAV_EVENT_PREFIXES` never overlap):
+
+```python
+if text.startswith(NAV_EVENT_PREFIXES):
+    self._on_nav_event()
+elif text.startswith(OPENWINDOW_EVENT_PREFIX):
+    self._on_openwindow_event()
+elif text.startswith("configreloaded>>"):
+    await self._invoke_config_reloaded()
+```
+
+#### New file `backend/app_launch_attrib.py`
+
+Mirrors `nav_attrib.py`'s structure, constants-as-tunables, and docstring
+conventions. No `EpisodeCoalescer` equivalent is needed: nav needed one
+because `activewindow>>`/`workspace>>` fire *together* for one user
+action and must be merged before attribution; here there is exactly one
+event type (`openwindow>>`), and single-shot arm consumption (an arm is
+cleared the instant it's used to attribute one event) already stops a
+second, near-simultaneous `openwindow>>` from the same app's own startup
+(e.g. a splash window plus a main window) from being double-counted — the
+second one simply finds no live armed channel and is correctly
+unattributed.
+
+```python
+"""Keybind-vs-panel attribution for app launches, correlated against
+Hyprland's own openwindow>> event.
+
+Not an Omarchy-documented convention -- our own timing-correlation
+heuristic, same category as nav_attrib.py's NavAttributor. Only ever
+timestamps are tracked in memory; window class/title from the triggering
+openwindow>> line is never read, let alone stored.
+
+Known limitation (documented, not fixed): an openwindow>> that fires for
+an unrelated reason while a channel is still armed (e.g. a notification's
+own window, or a second app the user manually started from a terminal
+during the panel's long arm window) can be misattributed. This is
+inherent to timing correlation without dispatcher-identity ground truth,
+same accepted trade-off nav_attrib.py already documents for a personal
+adoption metric.
+"""
+
+from __future__ import annotations
+
+# An app-launch keybind press is usually followed within a couple of
+# seconds by its window appearing; bounded generously for slow-starting
+# apps (Docker Desktop, Obsidian cold start) without risking correlation
+# with a much later, unrelated launch.
+KEYBIND_ARM_WINDOW_S = 3.0
+
+# The panel bind only opens the menu -- the actual launch (click or Enter
+# after typing a filter) can be many seconds later. Bounded generously so
+# "still browsing the menu" stays armed, but finite so a stale arm can't
+# attribute an unrelated launch minutes later.
+PANEL_ARM_WINDOW_S = 12.0
+
+
+class AppLaunchAttributor:
+    """Attributes an openwindow>> event to 'keybind', 'panel', or None."""
+
+    def __init__(self,
+                 keybind_window_s: float = KEYBIND_ARM_WINDOW_S,
+                 panel_window_s: float = PANEL_ARM_WINDOW_S):
+        self._keybind_window = keybind_window_s
+        self._panel_window = panel_window_s
+        self._keybind_armed_ts: float | None = None
+        self._panel_armed_ts: float | None = None
+
+    def note_keybind_press(self, monotonic_ts: float) -> None:
+        """Call only when the keydown's (modmask, key) matches
+        keybinds.py's live app_launch allowlist."""
+        self._keybind_armed_ts = monotonic_ts
+
+    def note_panel_press(self, monotonic_ts: float) -> None:
+        """Call only when the keydown's (modmask, key) matches keybinds.py's
+        live panel_launch allowlist (SUPER+SPACE / SUPER+ALT+SPACE)."""
+        self._panel_armed_ts = monotonic_ts
+
+    def on_openwindow(self, monotonic_ts: float) -> str | None:
+        keybind_ok = self._within_window(
+            self._keybind_armed_ts, monotonic_ts, self._keybind_window)
+        panel_ok = self._within_window(
+            self._panel_armed_ts, monotonic_ts, self._panel_window)
+
+        if keybind_ok and panel_ok:
+            # Most-recent-arm-wins, same tie-break NavAttributor uses for
+            # simultaneous keyboard/mouse signals.
+            winner = ("keybind" if self._keybind_armed_ts > self._panel_armed_ts
+                      else "panel")
+        elif keybind_ok:
+            winner = "keybind"
+        elif panel_ok:
+            winner = "panel"
+        else:
+            return None
+
+        # Single-shot consumption: clear the arm that was just used so a
+        # second, closely-following openwindow>> (e.g. a second window
+        # from the same app's own startup) isn't double-counted.
+        if winner == "keybind":
+            self._keybind_armed_ts = None
+        else:
+            self._panel_armed_ts = None
+        return winner
+
+    @staticmethod
+    def _within_window(armed_ts: float | None, now_ts: float, window_s: float) -> bool:
+        if armed_ts is None:
+            return False
+        delta = now_ts - armed_ts
+        return 0 <= delta <= window_s
+```
+
+#### `backend/evdev_reader.py`
+
+`EvdevSource.__init__` gains two more required callbacks, alongside the
+existing `on_mouse_activity`/`on_keyboard_nav_combo`:
+
+```python
+def __init__(self, nav_matcher, on_typing_burst, on_mouse_activity,
+             on_keyboard_nav_combo, on_app_launch_keybind_combo,
+             on_panel_launch_combo):
+    ...
+    self._on_app_launch_keybind_combo = on_app_launch_keybind_combo
+    self._on_panel_launch_combo = on_panel_launch_combo
+```
+
+`_handle_key`, immediately alongside the existing nav-combo check
+(independent `if`s, not `elif` -- defensively correct even though the
+three allowlists are disjoint by construction):
+
+```python
+if value == 1 and not is_modifier:
+    if self._nav_matcher.matches(code):
+        self._on_keyboard_nav_combo(now)
+    if self._nav_matcher.matches_app_launch(code):
+        self._on_app_launch_keybind_combo(now)
+    if self._nav_matcher.matches_panel_launch(code):
+        self._on_panel_launch_combo(now)
+```
+
+#### `backend/storage.py`
+
+New table, added via the existing idempotent `_SCHEMA` script (a *new*
+table needs no migration):
+
+```sql
+CREATE TABLE IF NOT EXISTS app_launch_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    occurred_at INTEGER NOT NULL,
+    method TEXT NOT NULL CHECK (method IN ('keybind','panel'))
+);
+CREATE INDEX IF NOT EXISTS idx_app_launch_events_occurred_at ON app_launch_events(occurred_at);
+```
+
+`daily_rollup` needs two new columns on an **existing** table, which
+`CREATE TABLE IF NOT EXISTS` cannot add for installs upgrading from a
+pre-addendum database — this needs an explicit, idempotent migration.
+Add a `_migrate_schema()` method, called once from `__init__` right after
+`executescript(_SCHEMA)`:
+
+```python
+def _migrate_schema(self) -> None:
+    existing = {row[1] for row in
+                self._conn.execute("PRAGMA table_info(daily_rollup)")}
+    for column in ("app_launch_keybind_count", "app_launch_panel_count"):
+        if column not in existing:
+            self._conn.execute(
+                f"ALTER TABLE daily_rollup ADD COLUMN {column} "
+                f"INTEGER NOT NULL DEFAULT 0")
+```
+
+`_PendingWrites` gains `app_launch_events: list = field(default_factory=list)`;
+`queue_app_launch_event(method, occurred_at)` mirrors `queue_nav_event`
+exactly; `has_pending()`/`flush()` include it (insert into
+`app_launch_events`, add `_day_key(occurred_at)` to `touched_days`, same
+pattern as `nav_events`).
+
+`_recompute_rollup(day)` gains two more `SELECT COUNT(*)` queries
+(`method = 'keybind'` / `method = 'panel'` against `app_launch_events`,
+same bounds as the existing nav queries) and includes both counts in the
+`INSERT ... ON CONFLICT DO UPDATE` for `daily_rollup`.
+
+`get_stats(window)` gains three fields, same shape as the nav split (no
+`mouse_weight`-style calibration knob -- see "Considered and rejected"):
+
+```python
+app_launch_keybind, app_launch_panel = self._conn.execute(
+    f"SELECT COALESCE(SUM(app_launch_keybind_count),0), "
+    f"COALESCE(SUM(app_launch_panel_count),0) FROM daily_rollup "
+    f"WHERE day IN ({placeholders})", days_or_all_clause).fetchone()
+...
+applaunch_denom = app_launch_keybind + app_launch_panel
+return {
+    ...,  # existing fields unchanged
+    "app_launch_keybind": app_launch_keybind,
+    "app_launch_panel": app_launch_panel,
+    "app_launch_keybind_pct":
+        round(100 * app_launch_keybind / applaunch_denom, 1) if applaunch_denom else None,
+}
+```
+
+(Same pattern for both the `window == "all"` branch and the day-list
+branch, mirroring how `nav_kb`/`nav_mouse` are already summed in both
+branches.) `has_data` gains this metric to its `bool(...)` check:
+`bool(burst_count or nav_total or cheatsheet_count or applaunch_denom)`.
+
+`get_daily_history(days)` gains the same three fields per series entry
+(query `daily_rollup`'s two new columns alongside the existing ones;
+`None`/zeroed for a day with no `daily_rollup` row, exactly like every
+other field in that method).
+
+`get_records()` gains one new record, same shape and gating philosophy as
+`best_keyboard_day` (a minimum daily volume so a 1-launch day can't top
+the board by luck; the threshold is lower than nav's `RECORD_MIN_NAV_DAY
+= 20` because app launches per day are naturally far fewer than nav
+events):
+
+```python
+RECORD_MIN_APPLAUNCH_DAY = 5  # alongside RECORD_MIN_NAV_DAY
+
+row = self._conn.execute(
+    "SELECT day, app_launch_keybind_count, app_launch_panel_count FROM daily_rollup "
+    "WHERE app_launch_keybind_count + app_launch_panel_count >= ? "
+    "ORDER BY CAST(app_launch_keybind_count AS REAL) / "
+    "(app_launch_keybind_count + app_launch_panel_count) DESC LIMIT 1",
+    (RECORD_MIN_APPLAUNCH_DAY,)).fetchone()
+if row:
+    day, kb, panel = row
+    records["best_keybind_launch_day"] = {
+        "value": round(100 * kb / (kb + panel), 1), "day": day}
+```
+
+#### `backend/daemon.py`
+
+```python
+from app_launch_attrib import AppLaunchAttributor
+from keybinds import NavComboMatcher, fetch_keybind_allowlists  # renamed import
+```
+
+`Daemon.__init__`:
+
+```python
+self.app_launch_attributor = AppLaunchAttributor()
+self.evdev_source = EvdevSource(
+    self.nav_matcher,
+    on_typing_burst=self._on_typing_burst,
+    on_mouse_activity=self.attributor.note_mouse_activity,
+    on_keyboard_nav_combo=self.attributor.note_keyboard_nav_combo,
+    on_app_launch_keybind_combo=self.app_launch_attributor.note_keybind_press,
+    on_panel_launch_combo=self.app_launch_attributor.note_panel_press,
+)
+self.hypr_client = HyprSocketClient(
+    on_nav_event=self._on_nav_event,
+    on_config_reloaded=self._refresh_allowlist,
+    on_openwindow_event=self._on_openwindow_event,
+)
+```
+
+New handler, alongside `_on_nav_event`:
+
+```python
+def _on_openwindow_event(self) -> None:
+    method = self.app_launch_attributor.on_openwindow(time.monotonic())
+    if method is not None:
+        self.storage.queue_app_launch_event(method, time.time())
+```
+
+`_refresh_allowlist` now fetches and distributes all three allowlists in
+one `hyprctl binds -j` call (no extra subprocess spawn per config reload):
+
+```python
+async def _refresh_allowlist(self) -> None:
+    try:
+        allowlists = await fetch_keybind_allowlists()
+        self.nav_matcher.update_allowlist(allowlists["nav"])
+        self.nav_matcher.update_app_launch_allowlist(allowlists["app_launch"])
+        self.nav_matcher.update_panel_launch_allowlist(allowlists["panel_launch"])
+    except OSError:
+        pass
+```
+
+No `protocol.py` change, and no new daemon command: `stats`, `history`,
+and `records` already return `self.storage.get_stats/get_daily_history/
+get_records()`'s full dict verbatim, so the new fields ride along
+automatically once `storage.py` produces them — exactly how the existing
+`history` command needed no protocol changes when it was added.
+
+### Frontend wiring
+
+#### `BackendClient.qml`
+
+No changes needed — `lastStats`/`lastRecords`/`lastHistory` already carry
+whatever the daemon returns; the new fields arrive automatically.
+
+#### `BarWidget.qml`
+
+Add three read-through properties alongside the existing `nav*`/`cheatsheetCount`
+ones:
+
+```qml
+readonly property int appLaunchKeybindCount: stats ? Number(stats.app_launch_keybind || 0) : 0
+readonly property int appLaunchPanelCount: stats ? Number(stats.app_launch_panel || 0) : 0
+readonly property var appLaunchKeybindPct: stats ? stats.app_launch_keybind_pct : null
+```
+
+Pass through to the `StatsPanel` instantiation:
+
+```qml
+appLaunchKeybindCount: root.appLaunchKeybindCount
+appLaunchPanelCount: root.appLaunchPanelCount
+appLaunchKeybindPct: root.appLaunchKeybindPct
+```
+
+`compactLabel`/`formatCompactLabel` are **unchanged** — see "Bar-strip
+label" below for why this metric does not appear there.
+
+#### `StatsPanel.qml`
+
+Add matching properties: `property int appLaunchKeybindCount: 0`,
+`property int appLaunchPanelCount: 0`, `property var appLaunchKeybindPct: null`.
+New section markup in § "2.3 State: connected, has data" below.
+
+#### `StatsFormat.js` additions
+
+```js
+function formatAppLaunchCaption(keybindCount, panelCount) {
+  var total = (keybindCount || 0) + (panelCount || 0)
+  if (total === 0) return "No app launches recorded yet"
+  return (keybindCount || 0) + " via keybind · " + (panelCount || 0) + " via panel"
+}
+
+function appLaunchTrend(history) {
+  var series = historySeries(history)
+  if (series.length < 4) return null
+
+  var mid = Math.floor(series.length / 2)
+  var older = series.slice(0, mid)
+  var recent = series.slice(mid)
+
+  function halfPct(half) {
+    var kb = 0, total = 0
+    for (var i = 0; i < half.length; i++) {
+      kb += (half[i].app_launch_keybind || 0)
+      total += (half[i].app_launch_keybind || 0) + (half[i].app_launch_panel || 0)
+    }
+    return total > 0 ? (100 * kb / total) : null
+  }
+
+  var olderPct = halfPct(older)
+  var recentPct = halfPct(recent)
+  if (olderPct === null || recentPct === null) return null
+
+  var delta = recentPct - olderPct
+  var direction = "flat"
+  if (delta >= 5) direction = "up"
+  else if (delta <= -5) direction = "down"
+  return { direction: direction, olderPct: olderPct, recentPct: recentPct }
+}
+
+function formatAppLaunchTrendCaption(trend) {
+  if (trend === null || trend === undefined) return ""
+  var o = Math.round(trend.olderPct), r = Math.round(trend.recentPct)
+  if (trend.direction === "up") return "↑ leaning on shortcuts more (" + o + "% → " + r + "%)"
+  if (trend.direction === "down") return "↓ leaning on shortcuts less (" + o + "% → " + r + "%)"
+  return "steady (~" + r + "% via shortcut)"
+}
+```
+
+`appLaunchTrend` compares **percentage-point share**, not raw volume
+(unlike `cheatsheetTrend`, which compares raw counts) — deliberately
+different from the cheatsheet pattern: raw app-launch volume going up
+just means "launched more apps today," which says nothing about
+*adoption*; the keybind *share* of that volume is the actual signal. A
+fixed 5-percentage-point threshold (rather than `cheatsheetTrend`'s
+relative-ratio threshold) is the cleaner "meaningfully different" bar for
+an already-bounded 0–100 quantity, consistent with how the live split
+bar's own headline already reports whole percentage points.
+
+`recordCards(records)` gains a fourth entry, appended after
+`best_keyboard_day`:
+
+```js
+if (records.best_keybind_launch_day) {
+  cards.push({
+    icon: "🎯",
+    label: "Most keybind-driven launch day",
+    value: Math.round(records.best_keybind_launch_day.value) + "% via keybind",
+    day: _shortDay(records.best_keybind_launch_day.day),
+  })
+}
+```
+
+### Bar-strip label — unchanged
+
+Applying the same "does this clear the bar" scrutiny already used to drop
+cheatsheet count from `formatCompactLabel` (§1 above): **no.** This
+metric does not appear in the bar-strip label. The label already carries
+two hero numbers (`⌨68% · 74wpm`) and is already the longest string on
+most bars; a third fraction would either force truncation or crowd out
+the two metrics this plugin is actually *for* (keyboard-vs-mouse nav,
+typing speed). App-launch keybind-share is thematically adjacent to the
+nav split but is a distinctly secondary signal — same tier as cheatsheet
+count, which was already excluded for exactly this reason. It shows only
+in the panel. See "Considered and rejected" for the specific alternative
+layouts rejected here.
+
+### 2.3.4 `StatsPanel.qml` — new panel section: "App launches"
+
+Inserted after the existing 2.3.3 cheatsheet block, before 2.4 Records —
+last item inside the "connected, has data" `Column`. Deliberately scaled
+**down** from the hero split bar (2.3.2), not a duplicate of it: this is
+a secondary metric (same tier as the cheatsheet line), so it gets a
+compact mini split-bar plus a one-line trend caption, not a second
+14-day bar chart — reusing the "hero gets the full chart budget, secondary
+metrics get a cheap trend line" rule the "trends, titles, minimalism"
+revision already established for the cheatsheet line, rather than
+reopening that budget for a third chart.
+
+**Eyebrow**: `"APP LAUNCHES"` (per 2.3.0's convention).
+
+**Mini split-bar** (a smaller sibling of 2.3.2's split bar, not the same
+component reused verbatim — the size difference itself communicates
+"this one's secondary"). Exact geometry:
+
+```qml
+Column {
+  width: parent.width
+  spacing: Style.space(8)
+  topPadding: Style.space(4)
+
+  Text {
+    text: "APP LAUNCHES"
+    color: Util.alpha(root.barForeground, 0.55)
+    font.family: root.bar ? root.bar.fontFamily : Style.font.family
+    font.bold: true
+    font.pixelSize: Style.font.caption
+    font.letterSpacing: 1
+  }
+
+  Column {
+    width: parent.width
+    spacing: Style.space(4)
+
+    Item {
+      width: parent.width
+      height: kbLaunchPct.implicitHeight
+      Text {
+        id: kbLaunchPct
+        anchors.left: parent.left
+        text: "Keybind " + Math.round(root.appLaunchKeybindPct !== null ? root.appLaunchKeybindPct : 0) + "%"
+        visible: root.appLaunchKeybindPct !== null
+        color: Color.accent
+        font.bold: true
+        font.family: root.bar ? root.bar.fontFamily : Style.font.family
+        font.pixelSize: Style.font.bodySmall
+      }
+      Text {
+        anchors.right: parent.right
+        text: (root.appLaunchKeybindPct !== null ? Math.round(100 - root.appLaunchKeybindPct) : 0) + "% Panel"
+        visible: root.appLaunchKeybindPct !== null
+        color: Util.alpha(root.barForeground, 0.6)
+        font.family: root.bar ? root.bar.fontFamily : Style.font.family
+        font.pixelSize: Style.font.bodySmall
+      }
+      Text {
+        anchors.centerIn: parent
+        visible: root.appLaunchKeybindPct === null
+        text: "No app launches recorded yet"
+        color: Util.alpha(root.barForeground, 0.6)
+        font.family: root.bar ? root.bar.fontFamily : Style.font.family
+        font.pixelSize: Style.font.bodySmall
+      }
+    }
+
+    Rectangle {
+      visible: root.appLaunchKeybindPct !== null
+      width: parent.width
+      height: Style.space(8)
+      radius: height / 2
+      color: Style.normalFill
+      clip: true
+
+      Rectangle {
+        width: parent.width * (root.appLaunchKeybindPct / 100)
+        height: parent.height
+        color: Color.accent
+        Behavior on width { NumberAnimation { duration: 200; easing.type: Easing.OutCubic } }
+      }
+      Rectangle {
+        anchors.right: parent.right
+        width: parent.width * (1 - root.appLaunchKeybindPct / 100)
+        height: parent.height
+        color: Util.alpha(root.barForeground, 0.28)
+        Behavior on width { NumberAnimation { duration: 200; easing.type: Easing.OutCubic } }
+      }
+    }
+
+    Text {
+      width: parent.width
+      text: Fmt.formatAppLaunchCaption(root.appLaunchKeybindCount, root.appLaunchPanelCount)
+      color: Util.alpha(root.barForeground, 0.55)
+      font.family: root.bar ? root.bar.fontFamily : Style.font.family
+      font.pixelSize: Style.font.caption
+    }
+    Text {
+      width: parent.width
+      visible: Fmt.appLaunchTrend(root.history) !== null
+      text: Fmt.formatAppLaunchTrendCaption(Fmt.appLaunchTrend(root.history))
+      color: Util.alpha(root.barForeground, 0.5)
+      font.family: root.bar ? root.bar.fontFamily : Style.font.family
+      font.pixelSize: Style.font.caption
+    }
+  }
+}
+```
+
+Geometry deltas from 2.3.2's hero split bar, precisely: headline text
+`Style.font.bodySmall` (not `Style.font.title`), track height
+`Style.space(8)` (not `Style.space(14)`), no 14-day trend chart under it
+(one trend-caption `Text` instead). Track radius stays `height / 2`; fill
+colors are identical to 2.3.2's (`Color.accent` / `Util.alpha(root.barForeground,
+0.28)`) — same "accent = the good direction" grammar, deliberately not a
+new hue, so a third color doesn't compete for attention. Labels are plain
+words ("Keybind" / "Panel"), not the ⌨/🖱 glyphs 2.3.2 uses — those glyphs
+represent input *devices* (a mouse click vs. a keystroke); this axis is a
+*workflow path* (direct shortcut vs. browsing a menu), and either could in
+principle be operated via keyboard-only interaction with the panel menu
+itself, so reusing the device glyphs here would misrepresent what's being
+measured. `appLaunchKeybindPct === null` (has other data but zero
+attributed app-launch events yet) hides the bar and shows "No app
+launches recorded yet" centered — same null-handling rule as 2.3.2, never
+a fabricated 0-width or 50/50 bar.
+
+### Records — leaderboard extension
+
+No new component: `Fmt.recordCards(root.records)` already drives 2.4's
+`Repeater` over the existing card `Rectangle`; the fourth card (🎯 "Most
+keybind-driven launch day") slots in automatically once `recordCards`
+returns it. No QML changes to 2.4 itself.
+
+### Considered and rejected
+
+- **Keypress-only, fire-and-forget attribution of app launches** —
+  rejected; see decision 2 above. It only makes sense for interactions
+  where the keypress *is* the tracked act (the cheatsheet, whose press
+  renders the panel). For app launches the tracked event arrives after the
+  keypress (a new client), and a per-key bind wrapper doesn't scale, so
+  the panel bucket can't be represented that way at all.
+- **Splitting SUPER+SPACE and SUPER+ALT+SPACE into two panel sub-
+  buckets** — rejected; see decision 3. No distinct user-facing story,
+  and a three-way split dilutes the one binary axis this metric answers.
+- **A `mouse_weight`-style calibration knob for keybind vs. panel** —
+  rejected. `mouse_weight` exists because "how much a mouse click should
+  count against keyboard-first workflow" is a genuinely subjective
+  calibration (README's own framing: some people navigate mostly by
+  scroll wheel and don't want it to dominate). There's no analogous
+  subjective judgment here: a keybind press either preceded the launch or
+  it didn't. Weighting it would misrepresent an observed fact as an
+  opinion, so raw unweighted percentage is the only correct treatment.
+- **Per-app breakdown (which apps get launched via keybind vs. panel)** —
+  rejected on privacy grounds, deliberately, even though `openwindow>>`'s
+  payload carries window class/title for free. This plugin's stated
+  privacy stance is "no raw content, only aggregates"; extending that
+  posture to "no app identity either" keeps this metric in the same
+  spirit as the rest of the plugin — an adoption *signal*, not an
+  activity log of what was opened and when.
+- **A second full 14-day bar chart for app launches (mirroring 2.3.2's
+  keyboard-adoption chart)** — rejected. App-launch counts per day are
+  low and bursty (a handful of launches, not the dozens-to-hundreds of nav
+  events the existing chart aggregates), so 14 mostly-thin/near-empty
+  bars would be visual noise, not insight — the same "does this clear the
+  bar" test the "trends, titles, minimalism" revision already applied to
+  reject a cheatsheet chart for the identical reason. The two-chart
+  budget (sparkline + bar chart) established by that revision belongs to
+  the two hero metrics (WPM, keyboard/mouse nav); this addendum doesn't
+  reopen it. A mini split-bar (today's snapshot) plus a one-line trend
+  caption is the proportionate treatment for a secondary metric.
+- **Bar-strip inclusion, either as a third fraction or a compact glyph
+  (e.g. `🎯62%`)** — rejected; see "Bar-strip label" above. Crowds the two
+  hero numbers for a tertiary signal.
+- **Correlating against `activewindow>>`/`activewindowv2>>` instead of
+  `openwindow>>`** — rejected. Those events also fire on ordinary focus
+  switches between already-open windows (that's precisely what nav
+  attribution already uses them for), so they can't distinguish "a new
+  app was actually launched" from "an existing window was focused."
+  `openwindow>>` fires only when Hyprland creates a genuinely new
+  top-level client — the one event that actually means "launch."
+- **A generic "other/unattributed" third bucket surfaced in the UI** —
+  rejected. Unmatched presses and unmatched `openwindow>>` events stay
+  invisible, exactly like nav's unmatched combos — "hide rather than
+  fabricate," not "show a bucket for everything we're unsure about."
+- **Reusing the ⌨/🖱 glyphs from the nav split for this section's
+  headline** — rejected; see 2.3.4's geometry notes. Those glyphs name
+  input *devices*; this metric measures a *workflow path*, and reusing
+  device glyphs here would misrepresent what's being counted (the panel
+  can itself be operated entirely from the keyboard).
+
+### Explicitly out of scope
+
+- No per-app identity or breakdown, anywhere (privacy; see "Considered
+  and rejected").
+- No user-configurable `KEYBIND_ARM_WINDOW_S` / `PANEL_ARM_WINDOW_S` —
+  fixed constants in `app_launch_attrib.py`, not exposed via
+  `set_mouse_weight`-style commands or `manifest.json` schema.
+- No calibration weight for this split (see "Considered and rejected").
+- No bar-strip label change of any kind for this metric.
+- No splitting the panel bucket by which bind (SUPER+SPACE vs. SUPER+
+  ALT+SPACE) was pressed.
+- No new `manifest.json` schema field — this addendum needs no new
+  per-widget setting.
+- No `README.md` edits performed as part of this design addendum — the
+  README's "How it works," "Calibration," and "Stats windows & records"
+  sections should gain a paragraph describing this metric as a follow-up
+  once the dev agent implements it, but authoring that text is not part
+  of this spec-only pass.
+- No historical backfill for pre-upgrade installs — a database created
+  before this addendum simply has zero `app_launch_events` rows for past
+  days; the mini split-bar and trend caption show "no data" until new
+  tracking accumulates, exactly how any other new metric's rollout is
+  already handled elsewhere in this codebase (missing `daily_rollup` rows
+  already come back null/zeroed, never fabricated).
+- No live-push update specifically for this metric beyond what `stats`
+  already does — `app_launch_keybind`/`app_launch_panel`/
+  `app_launch_keybind_pct` ride along in the existing `stats_update` push
+  and `history`/`records` fetch-once-per-open pattern; no new push
+  cadence is introduced.
+
+### Token usage — addendum
+
+| Purpose | Token |
+|---|---|
+| Mini split-bar track height | `Style.space(8)` (vs. `Style.space(14)` for the hero split bar) |
+| Mini split-bar headline text | `Style.font.bodySmall` (vs. `Style.font.title` for the hero split bar) |
+| Mini split-bar fill colors | Same as 2.3.2: `Color.accent` (keybind) / `Util.alpha(root.barForeground, 0.28)` (panel) |
+| Mini split-bar radius | `height / 2`, same grammar as every other pill/track in this panel |
+| New record icon | `🎯` — distinct from the three already claimed (`⚡`,`🔥`,`⌨`) |
+| Trend caption | `Style.font.caption`, `Util.alpha(root.barForeground, 0.5)` — identical treatment to the cheatsheet trend caption (2.3.3) |

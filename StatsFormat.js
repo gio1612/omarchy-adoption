@@ -8,7 +8,7 @@ function formatCompactLabel(connected, hasData, wpmAvg, navKeyboardPct) {
   var wpm = Math.round(wpmAvg || 0)
   var navPart = "—"
   if (navKeyboardPct !== null && navKeyboardPct !== undefined) {
-    navPart = "⌨" + Math.round(navKeyboardPct) + "%"
+    navPart = Math.round(navKeyboardPct) + "% kbd"
   }
   return navPart + " · " + wpm + "wpm"
 }
@@ -54,6 +54,14 @@ function recordCards(records) {
       label: "Most keyboard-driven day",
       value: Math.round(records.best_keyboard_day.value) + "% kbd",
       day: _shortDay(records.best_keyboard_day.day),
+    })
+  }
+  if (records.best_keybind_launch_day) {
+    cards.push({
+      icon: "🎯",
+      label: "Most keybind-driven launch day",
+      value: Math.round(records.best_keybind_launch_day.value) + "% via keybind",
+      day: _shortDay(records.best_keybind_launch_day.day),
     })
   }
   return cards
@@ -166,4 +174,46 @@ function formatCheatsheetTrendCaption(trend) {
     return "↑ using it more (" + trend.olderSum + " → " + trend.recentSum + ")"
   }
   return "steady (" + trend.recentSum + " this period)"
+}
+
+function formatAppLaunchCaption(keybindCount, panelCount) {
+  var total = (keybindCount || 0) + (panelCount || 0)
+  if (total === 0) return "No app launches recorded yet"
+  return (keybindCount || 0) + " via keybind · " + (panelCount || 0) + " via panel"
+}
+
+function appLaunchTrend(history) {
+  var series = historySeries(history)
+  if (series.length < 4) return null
+
+  var mid = Math.floor(series.length / 2)
+  var older = series.slice(0, mid)
+  var recent = series.slice(mid)
+
+  function halfPct(half) {
+    var kb = 0, total = 0
+    for (var i = 0; i < half.length; i++) {
+      kb += (half[i].app_launch_keybind || 0)
+      total += (half[i].app_launch_keybind || 0) + (half[i].app_launch_panel || 0)
+    }
+    return total > 0 ? (100 * kb / total) : null
+  }
+
+  var olderPct = halfPct(older)
+  var recentPct = halfPct(recent)
+  if (olderPct === null || recentPct === null) return null
+
+  var delta = recentPct - olderPct
+  var direction = "flat"
+  if (delta >= 5) direction = "up"
+  else if (delta <= -5) direction = "down"
+  return { direction: direction, olderPct: olderPct, recentPct: recentPct }
+}
+
+function formatAppLaunchTrendCaption(trend) {
+  if (trend === null || trend === undefined) return ""
+  var o = Math.round(trend.olderPct), r = Math.round(trend.recentPct)
+  if (trend.direction === "up") return "↑ leaning on shortcuts more (" + o + "% → " + r + "%)"
+  if (trend.direction === "down") return "↓ leaning on shortcuts less (" + o + "% → " + r + "%)"
+  return "steady (~" + r + "% via shortcut)"
 }

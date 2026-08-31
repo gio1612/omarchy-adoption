@@ -1,8 +1,9 @@
+import asyncio
 import os
 
 import pytest
 
-from hypr_ipc import _newest_live_signature, socket2_path
+from hypr_ipc import HyprSocketClient, _newest_live_signature, socket2_path
 
 
 def _make_sig(base, name, has_socket=True):
@@ -59,3 +60,57 @@ def test_socket2_path_returns_none_when_nothing_found(tmp_path, monkeypatch):
 def test_socket2_path_returns_none_for_missing_sig(tmp_path, monkeypatch):
     monkeypatch.delenv("HYPRLAND_INSTANCE_SIGNATURE", raising=False)
     assert socket2_path(runtime_dir=str(tmp_path), signature="ghost") is None
+
+
+class FakeReader:
+    """Minimal stand-in for asyncio.StreamReader.readline() driving
+    HyprSocketClient._read_loop with canned lines, then EOF."""
+
+    def __init__(self, lines):
+        self._lines = list(lines)
+
+    async def readline(self):
+        if not self._lines:
+            return b""
+        return self._lines.pop(0)
+
+
+def _run_read_loop(lines):
+    calls = {"nav": 0, "openwindow": 0, "config_reloaded": 0}
+
+    def on_nav_event():
+        calls["nav"] += 1
+
+    def on_config_reloaded():
+        calls["config_reloaded"] += 1
+
+    def on_openwindow_event():
+        calls["openwindow"] += 1
+
+    client = HyprSocketClient(on_nav_event, on_config_reloaded, on_openwindow_event)
+    asyncio.run(client._read_loop(FakeReader(lines)))
+    return calls
+
+
+def test_read_loop_forwards_openwindow_event():
+    calls = _run_read_loop([b"openwindow>>abcd,1,foo,Foo Bar\n"])
+    assert calls == {"nav": 0, "openwindow": 1, "config_reloaded": 0}
+
+
+def test_read_loop_forwards_nav_event_not_openwindow():
+    calls = _run_read_loop([b"activewindow>>foo,bar\n"])
+    assert calls == {"nav": 1, "openwindow": 0, "config_reloaded": 0}
+
+
+def test_read_loop_forwards_config_reloaded_not_openwindow():
+    calls = _run_read_loop([b"configreloaded>>\n"])
+    assert calls == {"nav": 0, "openwindow": 0, "config_reloaded": 1}
+
+
+def test_read_loop_openwindow_and_nav_never_double_fire_same_line():
+    calls = _run_read_loop([
+        b"openwindow>>abcd,1,foo,Foo Bar\n",
+        b"workspace>>2\n",
+        b"openwindow>>efgh,2,bar,Bar Baz\n",
+    ])
+    assert calls == {"nav": 1, "openwindow": 2, "config_reloaded": 0}

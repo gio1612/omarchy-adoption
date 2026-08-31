@@ -30,8 +30,7 @@ unit_file="$unit_dir/$slug.service"
 install -d -m 700 -- "$lib_dir" "$data_dir" "$unit_dir"
 
 install -m 644 -- "$source_root"/backend/*.py "$lib_dir/"
-install -m 755 -- "$source_root/scripts/cheatsheet-wrapper.sh" "$lib_dir/"
-chmod 755 -- "$lib_dir/daemon.py" "$lib_dir/notify_cheatsheet.py"
+chmod 755 -- "$lib_dir/daemon.py"
 
 if [[ ! -x $venv_dir/bin/python ]]; then
   python3 -m venv "$venv_dir"
@@ -46,7 +45,18 @@ chmod 644 -- "$unit_file"
 systemctl --user daemon-reload
 systemctl --user enable --now "$slug.service"
 
-"$source_root/scripts/install-keybind.sh"
+# The tracker never touches Hyprland keybinds: SUPER+K is detected straight
+# from the raw keyboard stream (evdev), matching the allowlist parsed from
+# `hyprctl binds`. A pre-evdev install may however have left a tracking block
+# and wrapper behind -- remove them so SUPER+K returns to Omarchy's stock
+# `omarchy-menu-keybindings` binding. If the block is absent this is a no-op.
+bindings_file="$HOME/.config/hypr/bindings.lua"
+if [[ -f $bindings_file ]] && grep -qF "BEGIN omarchy-adoption-tracker" "$bindings_file"; then
+  sed -i '/-- BEGIN omarchy-adoption-tracker/,/-- END omarchy-adoption-tracker/d' "$bindings_file"
+  echo "setup.sh: removed legacy SUPER+K tracking block from $bindings_file (stock binding restored)"
+  command -v hyprctl >/dev/null 2>&1 && hyprctl reload >/dev/null 2>&1 || true
+fi
+rm -f -- "$lib_dir/cheatsheet-wrapper.sh" "$lib_dir/notify_cheatsheet.py"
 
 if ! "$venv_dir/bin/python" "$lib_dir/daemon.py" --self-test; then
   echo "setup.sh: self-test reported problems (see above) -- the daemon may still work" >&2

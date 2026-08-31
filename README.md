@@ -28,9 +28,13 @@ This will:
    (`omarchy-adoption-tracker.service`) -- this is a deliberate divergence
    from Omarchy's usual "start on demand" plugin convention, since the whole
    point is continuous background measurement.
-4. Add a small tracking wrapper around `SUPER+K` in your own
-   `~/.config/hypr/bindings.lua` (inside a clearly marked block; it aborts
-   instead of touching anything if you've already customized that binding).
+
+The tracker never touches your Hyprland keybindings: `SUPER+K` is detected
+straight from the raw keyboard stream (via `hyprctl binds` + evdev), so your
+`~/.config/hypr/bindings.lua` stays exactly as you left it. If you're
+upgrading from a pre-1.x install that injected a tracking wrapper block,
+`setup.sh` removes that legacy block and restores the stock binding
+automatically.
 
 Then add the "Adoption Tracker" bar widget from Omarchy's plugin/widget
 picker. Until you run `setup.sh`, the widget simply shows "not connected".
@@ -92,12 +96,39 @@ the calibration weight.
 
 A small Python daemon (`backend/daemon.py`, installed by `setup.sh`) reads
 `/dev/input/event*` for typing bursts and deliberate pointer actions --
-**button clicks and wheel scrolls only; cursor movement is ignored on
-purpose** -- Hyprland's own IPC event socket for window/workspace changes,
-and a notification from the `SUPER+K` wrapper -- and serves the resulting
-stats to the bar widget over a local Unix socket. See the plugin's design
-notes for the full breakdown of the typing-speed and
-navigation-attribution algorithms, including their known limitations.
+**button clicks, wheel scrolls and two-finger trackpad scrolls only; single
+finger/cursor movement is ignored on purpose** -- Hyprland's own IPC event
+socket for window/workspace changes, and the raw `SUPER+K` cheatsheet combo
+off the keyboard stream -- and serves the resulting stats to the bar widget
+over a local Unix socket. See the plugin's design notes for the full breakdown
+of the typing-speed and navigation-attribution algorithms, including their
+known limitations.
+
+## Debug audit logging
+
+The panel has a **Debug Audit** toggle (default off) that turns on live,
+in-memory logging of input classification so you can verify the tracker really
+is seeing your clicks, wheel/trackpad scrolls and keystrokes -- handy when the
+keyboard-vs-mouse split looks suspicious (e.g. a trackpad whose scrolls didn't
+register, which historically read as "99% keyboard").
+
+- The toggle is persisted (`logging_enabled`) and can be set live from a
+  socket too:
+  ```sh
+  echo '{"v":1,"id":1,"command":"set_logging","enabled":true}' | \
+    socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/omarchy-adoption-tracker/daemon.sock
+  ```
+- While on, the daemon records a bounded ring (up to 400 lines) of labels like
+  `device:... mouse:click`, `mouse:wheel`, `mouse:trackpad-scroll`, `key`, and
+  the device names discovered on each rescan. Read it via the panel's
+  **Refresh** button or:
+  ```sh
+  echo '{"v":1,"id":1,"command":"get_log"}' | \
+    socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/omarchy-adoption-tracker/daemon.sock
+  ```
+- **Privacy:** the log lives only in memory, is cleared when you toggle off,
+  and never contains raw key codes or coordinates -- just classification
+  labels. Nothing from it is written to disk.
 
 ## Uninstall
 

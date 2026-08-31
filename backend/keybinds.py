@@ -43,6 +43,34 @@ NAV_DESCRIPTION_PATTERNS = tuple(re.compile(p) for p in (
     r"^Move grouped window focus (left|right)$",     # changegroupactive
 ))
 
+# Omarchy's first-party default app-launch bind descriptions (bindings.lua).
+# Seeded from a live default install -- NOT exhaustive by design (a user's
+# own custom app-launch bind in ~/.config/hypr/bindings.lua isn't tracked
+# unless its description happens to match one of these exact strings). A
+# __lua bind whose description matches neither this set nor
+# PANEL_LAUNCH_DESCRIPTIONS is simply not allowlisted -- unattributed, not
+# guessed, same posture as NAV_DESCRIPTION_PATTERNS above.
+APP_LAUNCH_DESCRIPTIONS = frozenset({
+    "Terminal", "Browser", "Browser (private)", "File manager",
+    "File manager (cwd)", "Editor", "Tmux", "Herdr", "Music", "Music TUI",
+    "Docker", "Signal", "Obsidian", "Omawrite", "Passwords", "ChatGPT",
+    "Grok", "Calendar", "Email", "New email", "YouTube", "WhatsApp",
+    "Google Messages", "Google Photos", "Google Maps", "X", "X Post",
+})
+
+# Omarchy's app-entry-point menu binds. Both included in one shared
+# "panel" bucket -- see DESIGN.md "App-launch: keybind vs. panel", decision
+# 3, for why SUPER+SPACE (a root menu, not exclusively an app launcher) is
+# still included rather than excluded or split out.
+PANEL_LAUNCH_DESCRIPTIONS = frozenset({"Omarchy menu", "Apps menu"})
+
+# Omarchy's first-party keybindings cheatsheet bind (SUPER+K, description
+# "Keybindings", `omarchy-menu-keybindings`). Matched on its exact description
+# with the same "live, not hardcoded" posture as the other allowlists: a user
+# who rebinds or re-describes SUPER+K simply drops off the cheatsheet
+# allowlist instead of being guessed.
+CHEATSHEET_DESCRIPTIONS = frozenset({"Keybindings"})
+
 # Hyprland's own modmask bit values (SHIFT=1, CAPS=2, CTRL=4, ALT=8,
 # NUMLOCK=16, MOD3=32, SUPER=64, MOD5=128) -- confirmed against this
 # machine's live `hyprctl binds -j` output (SUPER+K -> modmask 64,
@@ -75,9 +103,10 @@ _SPECIAL_NAMES = {
 EVDEV_TO_HYPR_KEYNAME: dict[int, str] = {**_LETTER_NAMES, **_DIGIT_NAMES, **_SPECIAL_NAMES}
 
 
-async def fetch_nav_allowlist() -> set[tuple[int, str]]:
-    """Runs `hyprctl binds -j` and returns the set of (modmask, KEY) pairs
-    bound to a navigation dispatcher."""
+async def fetch_keybind_allowlists() -> dict[str, set[tuple[int, str]]]:
+    """Runs `hyprctl binds -j` once and returns all four live allowlists
+    (nav / app-launch / panel-launch / cheatsheet), each a set of
+    (modmask, KEY) pairs."""
     proc = await asyncio.create_subprocess_exec(
         "hyprctl", "binds", "-j",
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
@@ -85,15 +114,21 @@ async def fetch_nav_allowlist() -> set[tuple[int, str]]:
     return parse_binds_json(stdout.decode("utf-8", errors="replace"))
 
 
-def parse_binds_json(raw: str) -> set[tuple[int, str]]:
+def parse_binds_json(raw: str) -> dict[str, set[tuple[int, str]]]:
+    """Returns {"nav": ..., "app_launch": ..., "panel_launch": ...,
+    "cheatsheet": ...}, each a set of (modmask, KEY) pairs. Breaking
+    return-type change from the previous bare-set return -- update callers
+    (daemon.py) and tests/test_keybinds.py accordingly."""
+    result: dict[str, set[tuple[int, str]]] = {
+        "nav": set(), "app_launch": set(), "panel_launch": set(),
+        "cheatsheet": set()}
     try:
         binds = json.loads(raw)
     except json.JSONDecodeError:
-        return set()
+        return result
     if not isinstance(binds, list):
-        return set()
+        return result
 
-    allowlist: set[tuple[int, str]] = set()
     # Keyless __lua nav binds (Omarchy's workspace digits come through as
     # `code:N`, which `hyprctl binds -j` reports with an empty key). Their
     # descriptions still identify them, and their layout is fixed by Omarchy,
@@ -105,27 +140,38 @@ def parse_binds_json(raw: str) -> set[tuple[int, str]]:
             continue
         dispatcher = str(bind.get("dispatcher", ""))
         key = str(bind.get("key", "")).strip()
+        description = str(bind.get("description") or "").strip()
         try:
             modmask = int(bind.get("modmask", 0))
         except (TypeError, ValueError):
             modmask = 0
         if modmask == 0:
-            continue  # an un-modified nav bind can't be distinguished from typing
+            continue  # an un-modified bind can't be distinguished from typing
 
         if not key:
             if dispatcher == LUA_DISPATCHER and modmask and \
-                    (match := _workspace_number(bind.get("description"))):
+                    (match := _workspace_number(description)):
                 keyless_workspace_binds.append((modmask, match))
             continue
 
+        combo = (modmask, key.upper())
         if dispatcher in NAV_DISPATCHERS:
-            allowlist.add((modmask, key.upper()))
-        elif dispatcher == LUA_DISPATCHER and _is_nav_description(bind.get("description")):
-            allowlist.add((modmask, key.upper()))
+            result["nav"].add(combo)
+        elif dispatcher == LUA_DISPATCHER and _is_nav_description(description):
+            result["nav"].add(combo)
+        elif dispatcher == LUA_DISPATCHER and description in APP_LAUNCH_DESCRIPTIONS:
+            result["app_launch"].add(combo)
+        elif dispatcher == LUA_DISPATCHER and description in PANEL_LAUNCH_DESCRIPTIONS:
+            result["panel_launch"].add(combo)
+        elif dispatcher == LUA_DISPATCHER and description in CHEATSHEET_DESCRIPTIONS:
+            result["cheatsheet"].add(combo)
+        # first match wins, checked nav -> app_launch -> panel_launch ->
+        # cheatsheet; defensive only -- the four sources are disjoint by
+        # construction.
 
     for modmask, workspace in keyless_workspace_binds:
-        allowlist.add((modmask, str(workspace % 10)))  # workspace 10 -> "0"
-    return allowlist
+        result["nav"].add((modmask, str(workspace % 10)))  # workspace 10 -> "0"
+    return result
 
 
 _WORKSPACE_NUMBER_RE = re.compile(
@@ -151,10 +197,19 @@ def _is_nav_description(description) -> bool:
 class NavComboMatcher:
     """Tracks held-modifier state and checks a keydown against the live
     nav-dispatcher allowlist. Only ever consulted for combos with at least one
-    modifier held -- a bare, unmodified keystroke never reaches here."""
+    modifier held -- a bare, unmodified keystroke never reaches here.
+
+    Now serves four purposes -- nav / app-launch / panel-launch / cheatsheet
+    detection -- all sharing the same held-modifier state tracking, since only
+    one modifier-state machine is needed regardless of how many allowlists are
+    checked against it. Class name kept as NavComboMatcher to minimize diff
+    size; a rename is not required for the app-launch/cheatsheet addenda."""
 
     def __init__(self) -> None:
         self._allowlist: set[tuple[int, str]] = set()
+        self._app_launch_allowlist: set[tuple[int, str]] = set()
+        self._panel_launch_allowlist: set[tuple[int, str]] = set()
+        self._cheatsheet_allowlist: set[tuple[int, str]] = set()
         self._held_shift = False
         self._held_ctrl = False
         self._held_alt = False
@@ -162,6 +217,15 @@ class NavComboMatcher:
 
     def update_allowlist(self, allowlist: set[tuple[int, str]]) -> None:
         self._allowlist = {(mask, key.upper()) for mask, key in allowlist}
+
+    def update_app_launch_allowlist(self, allowlist: set[tuple[int, str]]) -> None:
+        self._app_launch_allowlist = {(mask, key.upper()) for mask, key in allowlist}
+
+    def update_panel_launch_allowlist(self, allowlist: set[tuple[int, str]]) -> None:
+        self._panel_launch_allowlist = {(mask, key.upper()) for mask, key in allowlist}
+
+    def update_cheatsheet_allowlist(self, allowlist: set[tuple[int, str]]) -> None:
+        self._cheatsheet_allowlist = {(mask, key.upper()) for mask, key in allowlist}
 
     def on_modifier_event(self, code: int, pressed: bool) -> bool:
         """Feed KEY_LEFT/RIGHT{SHIFT,CTRL,ALT,META} down/up events. Returns
@@ -193,10 +257,22 @@ class NavComboMatcher:
         return mask
 
     def matches(self, code: int) -> bool:
+        return self._matches_against(self._allowlist, code)
+
+    def matches_app_launch(self, code: int) -> bool:
+        return self._matches_against(self._app_launch_allowlist, code)
+
+    def matches_panel_launch(self, code: int) -> bool:
+        return self._matches_against(self._panel_launch_allowlist, code)
+
+    def matches_cheatsheet(self, code: int) -> bool:
+        return self._matches_against(self._cheatsheet_allowlist, code)
+
+    def _matches_against(self, allowlist: set[tuple[int, str]], code: int) -> bool:
         modmask = self.current_modmask
         if modmask == 0:
             return False
         name = EVDEV_TO_HYPR_KEYNAME.get(code)
         if name is None:
             return False
-        return (modmask, name) in self._allowlist
+        return (modmask, name) in allowlist

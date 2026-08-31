@@ -12,6 +12,7 @@ import os
 from collections.abc import Awaitable, Callable
 
 NAV_EVENT_PREFIXES = ("workspace>>", "workspacev2>>", "activewindow>>", "activewindowv2>>")
+OPENWINDOW_EVENT_PREFIX = "openwindow>>"
 RECONNECT_MIN_S = 0.5
 RECONNECT_MAX_S = 5.0
 
@@ -55,14 +56,16 @@ def socket2_path(runtime_dir: str | None = None,
 
 
 class HyprSocketClient:
-    """Connects to Hyprland's socket2 and dispatches nav / config-reload
-    events. Reconnects with backoff on compositor restart so a Hyprland
-    restart never takes down the rest of the daemon."""
+    """Connects to Hyprland's socket2 and dispatches nav / config-reload /
+    openwindow events. Reconnects with backoff on compositor restart so a
+    Hyprland restart never takes down the rest of the daemon."""
 
     def __init__(self, on_nav_event: Callable[[], None],
-                 on_config_reloaded: Callable[[], Awaitable[None] | None]):
+                 on_config_reloaded: Callable[[], Awaitable[None] | None],
+                 on_openwindow_event: Callable[[], None]):
         self._on_nav_event = on_nav_event
         self._on_config_reloaded = on_config_reloaded
+        self._on_openwindow_event = on_openwindow_event
         self._stop = False
 
     def stop(self) -> None:
@@ -104,6 +107,8 @@ class HyprSocketClient:
                 continue
             if text.startswith(NAV_EVENT_PREFIXES):
                 self._on_nav_event()
+            elif text.startswith(OPENWINDOW_EVENT_PREFIX):
+                self._on_openwindow_event()
             elif text.startswith("configreloaded>>"):
                 await self._invoke_config_reloaded()
 
