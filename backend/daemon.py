@@ -2,9 +2,10 @@
 """Omarchy Adoption Tracker background daemon.
 
 Ties together evdev input classification, Hyprland IPC nav-attribution, and
-the SUPER+K cheatsheet notification into local SQLite aggregates, served to
-the plugin's Quickshell BarWidget/Panel over a Unix socket. Local-only: no
-network calls, no raw keycodes or content ever persisted.
+the SUPER+K cheatsheet combo detected straight off the raw keyboard stream
+into local SQLite aggregates, served to the plugin's Quickshell
+BarWidget/Panel over a Unix socket. Local-only: no network calls, no raw
+keycodes or content ever persisted.
 
 Run standalone with --self-test to sanity-check the environment without
 starting the full daemon.
@@ -20,9 +21,10 @@ import time
 
 import evdev
 
+from app_launch_attrib import AppLaunchAttributor
 from evdev_reader import EvdevSource
 from hypr_ipc import HyprSocketClient
-from keybinds import NavComboMatcher, fetch_nav_allowlist
+from keybinds import NavComboMatcher, fetch_keybind_allowlists
 from nav_attrib import EpisodeCoalescer, NavAttributor
 from protocol import PROTOCOL_VERSION, dumps, event, parse_line, response
 from storage import Storage
@@ -31,6 +33,9 @@ DAEMON_VERSION = "0.1.0"
 SLUG = "omarchy-adoption-tracker"
 
 FLUSH_INTERVAL_S = 2.0
+
+# Max audit-log lines kept in memory for the panel's `get_log` view.
+AUDIT_LOG_LIMIT = 400
 
 
 def data_dir() -> str:
@@ -58,18 +63,35 @@ class Daemon:
         self.nav_matcher = NavComboMatcher()
         self.attributor = NavAttributor()
         self.coalescer = EpisodeCoalescer()
+        self.app_launch_attributor = AppLaunchAttributor()
         self.clients: set[asyncio.StreamWriter] = set()
+        # Audited input activity lives in a bounded in-memory ring that the
+        # panel can read via `get_log` while logging is enabled -- never
+        # persisted, and only logged when logging_enabled is on.
+        self._log_ring: list[str] = []
+        self._log_enabled = self.storage.logging_enabled()
         self.evdev_source = EvdevSource(
             self.nav_matcher,
             on_typing_burst=self._on_typing_burst,
             on_mouse_activity=self.attributor.note_mouse_activity,
             on_keyboard_nav_combo=self.attributor.note_keyboard_nav_combo,
+            on_app_launch_keybind_combo=self.app_launch_attributor.note_keybind_press,
+            on_panel_launch_combo=self.app_launch_attributor.note_panel_press,
+            on_cheatsheet_combo=self._on_cheatsheet_combo,
+            logging_enabled=self._log_enabled,
+            on_log=self._on_audit_log,
         )
         self.hypr_client = HyprSocketClient(
             on_nav_event=self._on_nav_event,
             on_config_reloaded=self._refresh_allowlist,
+            on_openwindow_event=self._on_openwindow_event,
         )
         self._stopping = False
+
+    def _on_audit_log(self, line: str) -> None:
+        self._log_ring.append(line)
+        if len(self._log_ring) > AUDIT_LOG_LIMIT:
+            del self._log_ring[: len(self._log_ring) - AUDIT_LOG_LIMIT]
 
     def _on_typing_burst(self, burst) -> None:
         self.storage.queue_typing_burst(burst)
@@ -82,10 +104,21 @@ class Daemon:
         if method is not None:
             self.storage.queue_nav_event(method, time.time())
 
+    def _on_openwindow_event(self) -> None:
+        method = self.app_launch_attributor.on_openwindow(time.monotonic())
+        if method is not None:
+            self.storage.queue_app_launch_event(method, time.time())
+
+    def _on_cheatsheet_combo(self, wall_ts: float) -> None:
+        self.storage.queue_cheatsheet_invocation(wall_ts)
+
     async def _refresh_allowlist(self) -> None:
         try:
-            allowlist = await fetch_nav_allowlist()
-            self.nav_matcher.update_allowlist(allowlist)
+            allowlists = await fetch_keybind_allowlists()
+            self.nav_matcher.update_allowlist(allowlists["nav"])
+            self.nav_matcher.update_app_launch_allowlist(allowlists["app_launch"])
+            self.nav_matcher.update_panel_launch_allowlist(allowlists["panel_launch"])
+            self.nav_matcher.update_cheatsheet_allowlist(allowlists["cheatsheet"])
         except OSError:
             pass
 
@@ -101,7 +134,9 @@ class Daemon:
     async def _push_stats_update(self) -> None:
         if not self.clients:
             return
-        payload = (dumps(event("stats_update", self.storage.get_stats("today"))) + "\n"
+        state = self.storage.get_stats("today")
+        state["logging_enabled"] = self._log_enabled
+        payload = (dumps(event("stats_update", state)) + "\n"
                    ).encode("utf-8")
         dead = []
         for writer in self.clients:
@@ -135,15 +170,6 @@ class Daemon:
                 pass
 
     async def _process_message(self, message: dict, writer: asyncio.StreamWriter) -> None:
-        if message.get("type") == "event":
-            if message.get("name") == "cheatsheet_invoked":
-                try:
-                    ts = float(message.get("ts"))
-                except (TypeError, ValueError):
-                    ts = time.time()
-                self.storage.queue_cheatsheet_invocation(ts)
-            return  # fire-and-forget, no response expected
-
         request_id = message.get("id")
         command = message.get("command")
         if command == "hello":
@@ -152,6 +178,9 @@ class Daemon:
         elif command == "stats":
             window = message.get("window", "today")
             result = response(request_id, True, self.storage.get_stats(window))
+            # tack the runtime flag onto the stats so the panel can render the
+            # toggle's initial state on connect without a separate round-trip.
+            result["result"]["logging_enabled"] = self._log_enabled
         elif command == "records":
             result = response(request_id, True, self.storage.get_records())
         elif command == "history":
@@ -160,6 +189,20 @@ class Daemon:
             except (TypeError, ValueError):
                 days = 14
             result = response(request_id, True, self.storage.get_daily_history(days))
+        elif command == "get_log":
+            limit = AUDIT_LOG_LIMIT
+            result = response(request_id, True, {
+                "logging_enabled": self._log_enabled,
+                "lines": list(self._log_ring),
+            })
+        elif command == "set_logging":
+            enabled = bool(message.get("enabled", False))
+            self._log_enabled = enabled
+            self.storage.set_logging_enabled(enabled)
+            self.evdev_source.logging_enabled = enabled
+            if not enabled:
+                self._log_ring.clear()
+            result = response(request_id, True, {"logging_enabled": self._log_enabled})
         elif command == "set_mouse_weight":
             try:
                 weight = self.storage.set_mouse_weight(message.get("value"))

@@ -42,8 +42,16 @@ Panel {
   property real mouseWeight: 1.0
   property var navKeyboardPct: null
   property int cheatsheetCount: 0
+  property int appLaunchKeybindCount: 0
+  property int appLaunchPanelCount: 0
+  property var appLaunchKeybindPct: null
   property var records: null
   property var history: null
+  property bool loggingEnabled: false
+  property var logLines: []
+
+  signal toggleLogging()
+  signal refreshLog()
 
   KeyboardPanel {
     id: keyboardPanel
@@ -62,7 +70,6 @@ Panel {
       Column {
         id: contentColumn
         anchors.fill: parent
-        anchors.margins: Style.spacing.popupPadding
         spacing: Style.space(8)
 
         // 2.0 Header row (all states)
@@ -292,7 +299,7 @@ Panel {
               Text {
                 id: kbPct
                 anchors.left: parent.left
-                text: "⌨ " + Math.round(root.navKeyboardPct !== null ? root.navKeyboardPct : 0) + "%"
+                text: "KBD " + Math.round(root.navKeyboardPct !== null ? root.navKeyboardPct : 0) + "%"
                 visible: root.navKeyboardPct !== null
                 color: Color.accent
                 font.bold: true
@@ -301,7 +308,7 @@ Panel {
               }
               Text {
                 anchors.right: parent.right
-                text: (root.navKeyboardPct !== null ? Math.round(100 - root.navKeyboardPct) : 0) + "% 🖱"
+                text: (root.navKeyboardPct !== null ? Math.round(100 - root.navKeyboardPct) : 0) + "% MOUSE"
                 visible: root.navKeyboardPct !== null
                 color: Util.alpha(root.barForeground, 0.6)
                 font.family: root.bar ? root.bar.fontFamily : Style.font.family
@@ -456,6 +463,97 @@ Panel {
               font.pixelSize: Style.font.caption
             }
           }
+
+          // 2.3.4 App launches: keybind vs. panel mini split-bar
+          Column {
+            width: parent.width
+            spacing: Style.space(8)
+            topPadding: Style.space(4)
+
+            Text {
+              text: "APP LAUNCHES"
+              color: Util.alpha(root.barForeground, 0.55)
+              font.family: root.bar ? root.bar.fontFamily : Style.font.family
+              font.bold: true
+              font.pixelSize: Style.font.caption
+              font.letterSpacing: 1
+            }
+
+            Column {
+              width: parent.width
+              spacing: Style.space(4)
+
+              Item {
+                width: parent.width
+                height: kbLaunchPct.implicitHeight
+                Text {
+                  id: kbLaunchPct
+                  anchors.left: parent.left
+                  text: "Keybind " + Math.round(root.appLaunchKeybindPct !== null ? root.appLaunchKeybindPct : 0) + "%"
+                  visible: root.appLaunchKeybindPct !== null
+                  color: Color.accent
+                  font.bold: true
+                  font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                  font.pixelSize: Style.font.bodySmall
+                }
+                Text {
+                  anchors.right: parent.right
+                  text: (root.appLaunchKeybindPct !== null ? Math.round(100 - root.appLaunchKeybindPct) : 0) + "% Panel"
+                  visible: root.appLaunchKeybindPct !== null
+                  color: Util.alpha(root.barForeground, 0.6)
+                  font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                  font.pixelSize: Style.font.bodySmall
+                }
+                Text {
+                  anchors.centerIn: parent
+                  visible: root.appLaunchKeybindPct === null
+                  text: "No app launches recorded yet"
+                  color: Util.alpha(root.barForeground, 0.6)
+                  font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                  font.pixelSize: Style.font.bodySmall
+                }
+              }
+
+              Rectangle {
+                visible: root.appLaunchKeybindPct !== null
+                width: parent.width
+                height: Style.space(8)
+                radius: height / 2
+                color: Style.normalFill
+                clip: true
+
+                Rectangle {
+                  width: parent.width * (root.appLaunchKeybindPct / 100)
+                  height: parent.height
+                  color: Color.accent
+                  Behavior on width { NumberAnimation { duration: 200; easing.type: Easing.OutCubic } }
+                }
+                Rectangle {
+                  anchors.right: parent.right
+                  width: parent.width * (1 - root.appLaunchKeybindPct / 100)
+                  height: parent.height
+                  color: Util.alpha(root.barForeground, 0.28)
+                  Behavior on width { NumberAnimation { duration: 200; easing.type: Easing.OutCubic } }
+                }
+              }
+
+              Text {
+                width: parent.width
+                text: Fmt.formatAppLaunchCaption(root.appLaunchKeybindCount, root.appLaunchPanelCount)
+                color: Util.alpha(root.barForeground, 0.55)
+                font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                font.pixelSize: Style.font.caption
+              }
+              Text {
+                width: parent.width
+                visible: Fmt.appLaunchTrend(root.history) !== null
+                text: Fmt.formatAppLaunchTrendCaption(Fmt.appLaunchTrend(root.history))
+                color: Util.alpha(root.barForeground, 0.5)
+                font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                font.pixelSize: Style.font.caption
+              }
+            }
+          }
         }
 
         // 2.4 Records -- "Best of the best" leaderboard card
@@ -524,6 +622,153 @@ Panel {
                 font.pixelSize: Style.font.bodySmall
               }
             }
+          }
+        }
+
+        // 2.5 Debug audit logging -- toggle to enable/disable, and a small
+        // live view of the daemon's in-memory classification log.
+        Column {
+          width: parent.width
+          visible: root.connectedToDaemon
+          spacing: Style.space(8)
+          topPadding: Style.space(12)
+
+          Text {
+            text: "DEBUG AUDIT"
+            color: Util.alpha(root.barForeground, 0.55)
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.bold: true
+            font.pixelSize: Style.font.caption
+            font.letterSpacing: 1
+          }
+
+          Row {
+            width: parent.width
+            spacing: Style.space(8)
+            anchors.horizontalCenter: parent.horizontalCenter
+
+            Rectangle {
+              id: logToggle
+              width: Style.space(64)
+              height: Style.space(24)
+              radius: height / 2
+              color: root.loggingEnabled ? Color.accent : Style.normalFill
+              borderSpec: Border.flat(
+                root.loggingEnabled ? Color.accent : Util.alpha(root.barForeground, 0.3),
+                Style.space(1))
+
+              Rectangle {
+                width: parent.height - Style.space(6)
+                height: parent.height - Style.space(6)
+                radius: width / 2
+                color: root.loggingEnabled ? Util.alpha(root.barForeground, 1.0) : Util.alpha(root.barForeground, 0.7)
+                x: root.loggingEnabled ? parent.width - width - Style.space(3) : Style.space(3)
+                anchors.verticalCenter: parent.verticalCenter
+                Behavior on x { NumberAnimation { duration: 150; easing.type: Easing.OutCubic } }
+              }
+
+              MouseArea {
+                anchors.fill: parent
+                onClicked: root.toggleLogging()
+              }
+            }
+
+            Text {
+              text: root.loggingEnabled ? "Logging ON" : "Logging OFF"
+              color: root.barForeground
+              font.family: root.bar ? root.bar.fontFamily : Style.font.family
+              font.pixelSize: Style.font.bodySmall
+              anchors.verticalCenter: logToggle.verticalCenter
+            }
+          }
+
+          // live log view
+          Column {
+            width: parent.width
+            visible: root.loggingEnabled
+            spacing: Style.space(6)
+
+            Text {
+              width: parent.width
+              wrapMode: Text.WordWrap
+              text: "Input activity is being recorded in memory (not persisted). Scroll devices, clicks, wheels and trackpad scrolls appear here."
+              color: Util.alpha(root.barForeground, 0.6)
+              font.family: root.bar ? root.bar.fontFamily : Style.font.family
+              font.pixelSize: Style.font.caption
+            }
+
+            Rectangle {
+              width: parent.width
+              height: Math.min(root.logLines.length * Style.space(16), Style.space(180))
+              radius: Style.space(6)
+              color: Style.normalFill
+              clip: true
+
+              Flickable {
+                id: logFlick
+                anchors.fill: parent
+                contentHeight: logCol.implicitHeight
+                clip: true
+
+                Column {
+                  id: logCol
+                  width: parent.width
+                  spacing: Style.space(2)
+                  Repeater {
+                    model: root.logLines
+                    Text {
+                      width: parent.width
+                      wrapMode: Text.WrapAnywhere
+                      text: modelData
+                      color: Util.alpha(root.barForeground, 0.85)
+                      font.family: "monospace"
+                      font.pixelSize: Style.font.caption
+                    }
+                  }
+                }
+              }
+            }
+
+            Row {
+              width: parent.width
+              spacing: Style.space(8)
+
+              Rectangle {
+                width: refreshText.implicitWidth + Style.space(16)
+                height: refreshText.implicitHeight + Style.space(6)
+                radius: Style.space(4)
+                color: Style.normalFill
+                borderSpec: Border.flat(Util.alpha(root.barForeground, 0.3), Style.space(1))
+                Text {
+                  id: refreshText
+                  anchors.centerIn: parent
+                  text: "Refresh log"
+                  color: root.barForeground
+                  font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                  font.pixelSize: Style.font.bodySmall
+                }
+                MouseArea {
+                  anchors.fill: parent
+                  onClicked: root.refreshLog()
+                }
+              }
+              Text {
+                text: root.logLines.length + " lines"
+                color: Util.alpha(root.barForeground, 0.55)
+                font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                font.pixelSize: Style.font.caption
+                anchors.verticalCenter: parent.verticalCenter
+              }
+            }
+          }
+
+          // auto-refresh the log view while the panel is open and logging is on
+          Timer {
+            interval: 1000
+            running: root.connectedToDaemon && root.loggingEnabled && root.opened
+            repeat: true
+            triggeredOnStart: true
+            onTriggered: root.refreshLog()
           }
         }
       }

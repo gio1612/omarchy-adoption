@@ -75,6 +75,21 @@ def test_mouse_weight_persists_and_clamps(tmp_path):
     final.close()
 
 
+def test_logging_enabled_defaults_off_and_persists(tmp_path):
+    store = make_storage(tmp_path)
+    assert store.logging_enabled() is False
+    assert store.set_logging_enabled(True) is True
+    assert store.logging_enabled() is True
+    assert store.set_logging_enabled(0) is False
+    assert store.logging_enabled() is False
+    # true value survives a reopen
+    store.set_logging_enabled(True)
+    store.close()
+    reopened = make_storage(tmp_path)
+    assert reopened.logging_enabled() is True
+    reopened.close()
+
+
 def test_weighted_nav_split(tmp_path):
     # weight 2.0: the single mouse event counts double against the keyboard
     store = make_storage(tmp_path)
@@ -295,3 +310,161 @@ def test_daily_history_no_nav_events_leaves_pct_null(tmp_path):
     assert today_row["nav_keyboard_pct"] is None
     assert today_row["cheatsheet_count"] == 1
     store.close()
+
+
+def test_app_launch_events_ratio(tmp_path):
+    store = make_storage(tmp_path)
+    now = time.time()
+    store.queue_app_launch_event("keybind", now)
+    store.queue_app_launch_event("keybind", now)
+    store.queue_app_launch_event("panel", now)
+    store.flush()
+    stats = store.get_stats("today")
+    assert stats["app_launch_keybind"] == 2
+    assert stats["app_launch_panel"] == 1
+    assert stats["app_launch_keybind_pct"] == pytest.approx(66.7, rel=0.01)
+    store.close()
+
+
+def test_app_launch_no_events_leaves_pct_null(tmp_path):
+    store = make_storage(tmp_path)
+    stats = store.get_stats("today")
+    assert stats["app_launch_keybind"] == 0
+    assert stats["app_launch_panel"] == 0
+    assert stats["app_launch_keybind_pct"] is None
+    store.close()
+
+
+def test_app_launch_events_contribute_to_has_data(tmp_path):
+    store = make_storage(tmp_path)
+    assert store.get_stats("today")["has_data"] is False
+    store.queue_app_launch_event("keybind", time.time())
+    store.flush()
+    assert store.get_stats("today")["has_data"] is True
+    store.close()
+
+
+def test_app_launch_not_weighted_by_mouse_weight(tmp_path):
+    # app-launch split has no calibration knob -- mouse_weight must not
+    # affect it, unlike the nav split.
+    store = make_storage(tmp_path)
+    now = time.time()
+    store.queue_app_launch_event("keybind", now)
+    store.queue_app_launch_event("panel", now)
+    store.flush()
+    store.set_mouse_weight(5.0)
+    stats = store.get_stats("today")
+    assert stats["app_launch_keybind_pct"] == 50.0
+    store.close()
+
+
+def test_daily_history_app_launch_fields(tmp_path):
+    store = make_storage(tmp_path)
+    now = time.time()
+    store.queue_app_launch_event("keybind", now)
+    store.queue_app_launch_event("keybind", now)
+    store.queue_app_launch_event("panel", now)
+    store.flush()
+
+    history = store.get_daily_history(7)
+    today_row = history["series"][-1]
+    assert today_row["app_launch_keybind"] == 2
+    assert today_row["app_launch_panel"] == 1
+    store.close()
+
+
+def test_daily_history_app_launch_zeroed_for_untouched_day(tmp_path):
+    store = make_storage(tmp_path)
+    history = store.get_daily_history(3)
+    for day in history["series"]:
+        assert day["app_launch_keybind"] == 0
+        assert day["app_launch_panel"] == 0
+    store.close()
+
+
+def test_records_empty_has_no_best_keybind_launch_day(tmp_path):
+    store = make_storage(tmp_path)
+    assert store.get_records() == {}
+    store.close()
+
+
+def test_records_best_keybind_launch_day_requires_minimum_volume(tmp_path):
+    store = make_storage(tmp_path)
+
+    def ts_for(day_ago, hour=12):
+        d = datetime.now().astimezone() - timedelta(days=day_ago)
+        return d.replace(hour=hour, minute=0, second=0, microsecond=0).timestamp()
+
+    # two days ago: 100% keybind but under the RECORD_MIN_APPLAUNCH_DAY=5
+    # volume threshold -- must NOT win the record
+    store.queue_app_launch_event("keybind", ts_for(2))
+    store.queue_app_launch_event("keybind", ts_for(2))
+    # yesterday: enough volume (5), 80% keybind -- wins
+    for _ in range(4):
+        store.queue_app_launch_event("keybind", ts_for(1))
+    store.queue_app_launch_event("panel", ts_for(1))
+    store.flush()
+
+    records = store.get_records()
+    best = records["best_keybind_launch_day"]
+    assert best["value"] == 80.0
+    assert best["day"] == _day_str(1)
+    store.close()
+
+
+def test_prune_old_data_removes_old_app_launch_events(tmp_path):
+    store = make_storage(tmp_path)
+    old_ts = time.time() - 200 * 86400
+    store.queue_app_launch_event("keybind", old_ts)
+    store.flush()
+    store.prune_old_data(retention_days=90)
+
+    raw_count = store._conn.execute(
+        "SELECT COUNT(*) FROM app_launch_events").fetchone()[0]
+    assert raw_count == 0
+    # daily_rollup aggregate survives pruning, same as every other metric
+    stats = store.get_stats("all")
+    assert stats["app_launch_keybind"] == 1
+    store.close()
+
+
+def test_migrate_schema_adds_app_launch_columns_to_existing_db(tmp_path):
+    # simulate a pre-addendum database: create the schema without the two
+    # new daily_rollup columns, then reopen with Storage and confirm the
+    # idempotent migration adds them without data loss.
+    import sqlite3
+
+    db_path = os.path.join(str(tmp_path), "legacy.db")
+    conn = sqlite3.connect(db_path)
+    conn.execute("""
+        CREATE TABLE daily_rollup (
+            day TEXT PRIMARY KEY,
+            typing_burst_count INTEGER NOT NULL DEFAULT 0,
+            typing_keystroke_total INTEGER NOT NULL DEFAULT 0,
+            typing_wpm_avg REAL,
+            typing_wpm_max REAL,
+            nav_keyboard_count INTEGER NOT NULL DEFAULT 0,
+            nav_mouse_count INTEGER NOT NULL DEFAULT 0,
+            cheatsheet_count INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL
+        )
+    """)
+    conn.execute(
+        "INSERT INTO daily_rollup(day, updated_at) VALUES ('2020-01-01', 0)")
+    conn.commit()
+    conn.close()
+
+    store = Storage(db_path)
+    columns = {row[1] for row in
+               store._conn.execute("PRAGMA table_info(daily_rollup)")}
+    assert "app_launch_keybind_count" in columns
+    assert "app_launch_panel_count" in columns
+    row = store._conn.execute(
+        "SELECT app_launch_keybind_count, app_launch_panel_count "
+        "FROM daily_rollup WHERE day = '2020-01-01'").fetchone()
+    assert row == (0, 0)
+    store.close()
+
+    # reopening again is a no-op (idempotent, no error)
+    reopened = Storage(db_path)
+    reopened.close()

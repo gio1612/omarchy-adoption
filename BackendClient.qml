@@ -18,8 +18,10 @@ Item {
   property var lastStats: null
   property var lastRecords: null
   property var lastHistory: null
+  property var lastLog: []
   property int reconnectAttempt: 0
 
+  readonly property bool loggingEnabled: !!(lastStats && lastStats.logging_enabled)
   readonly property var activeSocket: socketLoader.item
   readonly property bool connected: !!(activeSocket && activeSocket.connected)
 
@@ -77,6 +79,37 @@ Item {
         root.historyReceived(result)
       }
     })
+  }
+
+  function setLogging(enabled) {
+    sendCommand("set_logging", { enabled: !!enabled }, function(ok, result) {
+      if (ok && result) {
+        root.lastStats = incrementLoggingFlag(root.lastStats, result.logging_enabled)
+      }
+    })
+  }
+
+  function requestLog(callback) {
+    sendCommand("get_log", null, function(ok, result) {
+      if (ok && result) {
+        root.lastStats = incrementLoggingFlag(root.lastStats, result.logging_enabled)
+        root.lastLog = result.lines || []
+        if (typeof callback === "function") callback(result.lines || [])
+      } else if (typeof callback === "function") {
+        root.lastLog = []
+        callback([])
+      }
+    })
+  }
+
+  function incrementLoggingFlag(stats, enabled) {
+    if (stats && enabled !== undefined && enabled !== null) {
+      var merged = ({})
+      for (var key in stats) merged[key] = stats[key]
+      merged.logging_enabled = enabled
+      return merged
+    }
+    return stats
   }
 
   function handleLine(line) {

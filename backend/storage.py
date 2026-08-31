@@ -24,6 +24,10 @@ MOUSE_WEIGHT_MIN, MOUSE_WEIGHT_MAX = 0.1, 10.0
 # become the "best keyboard day" record -- otherwise a 2-event day tops the
 # board by luck.
 RECORD_MIN_NAV_DAY = 20
+# Same gating philosophy as RECORD_MIN_NAV_DAY, applied to app launches --
+# lower threshold since app launches per day are naturally far fewer than
+# nav events.
+RECORD_MIN_APPLAUNCH_DAY = 5
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS typing_bursts (
@@ -60,6 +64,13 @@ CREATE TABLE IF NOT EXISTS daily_rollup (
     updated_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS app_launch_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    occurred_at INTEGER NOT NULL,
+    method TEXT NOT NULL CHECK (method IN ('keybind','panel'))
+);
+CREATE INDEX IF NOT EXISTS idx_app_launch_events_occurred_at ON app_launch_events(occurred_at);
+
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT
@@ -82,6 +93,7 @@ class _PendingWrites:
     typing_bursts: list = field(default_factory=list)
     nav_events: list = field(default_factory=list)
     cheatsheet_invocations: list = field(default_factory=list)
+    app_launch_events: list = field(default_factory=list)
 
 
 class Storage:
@@ -90,13 +102,27 @@ class Storage:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=2000")
         self._conn.executescript(_SCHEMA)
+        self._migrate_schema()
         self._ensure_meta("schema_version", str(SCHEMA_VERSION))
         self._ensure_meta("retention_days", str(DEFAULT_RETENTION_DAYS))
         self._ensure_meta("mouse_weight", str(DEFAULT_MOUSE_WEIGHT))
+        self._ensure_meta("logging_enabled", "0")
         self._pending = _PendingWrites()
 
     def close(self) -> None:
         self._conn.close()
+
+    def _migrate_schema(self) -> None:
+        """Idempotent migration for columns added to an *existing* table --
+        CREATE TABLE IF NOT EXISTS in _SCHEMA can't add these for installs
+        upgrading from a pre-app-launch database."""
+        existing = {row[1] for row in
+                    self._conn.execute("PRAGMA table_info(daily_rollup)")}
+        for column in ("app_launch_keybind_count", "app_launch_panel_count"):
+            if column not in existing:
+                self._conn.execute(
+                    f"ALTER TABLE daily_rollup ADD COLUMN {column} "
+                    f"INTEGER NOT NULL DEFAULT 0")
 
     def _ensure_meta(self, key: str, default_value: str) -> None:
         cur = self._conn.execute("SELECT value FROM meta WHERE key = ?", (key,))
@@ -132,6 +158,22 @@ class Storage:
             (str(clamped),))
         return clamped
 
+    def logging_enabled(self) -> bool:
+        """Whether the daemon should emit audit log lines for input activity
+        (never persisted beyond the boolean -- hw logs are ephemeral only)."""
+        cur = self._conn.execute("SELECT value FROM meta WHERE key = 'logging_enabled'")
+        row = cur.fetchone()
+        return row is not None and row[0] == "1"
+
+    def set_logging_enabled(self, enabled: bool) -> bool:
+        """Persist the audit-logging flag; returns the value now in effect."""
+        enabled = bool(enabled)
+        self._conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('logging_enabled', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            ("1" if enabled else "0",))
+        return enabled
+
     # -- queueing: the daemon appends here as events happen, and calls
     # flush() on a ~2s timer so writes are batched rather than per-event. --
 
@@ -144,16 +186,20 @@ class Storage:
     def queue_cheatsheet_invocation(self, occurred_at: float) -> None:
         self._pending.cheatsheet_invocations.append(occurred_at)
 
+    def queue_app_launch_event(self, method: str, occurred_at: float) -> None:
+        self._pending.app_launch_events.append((method, occurred_at))
+
     def has_pending(self) -> bool:
         p = self._pending
-        return bool(p.typing_bursts or p.nav_events or p.cheatsheet_invocations)
+        return bool(p.typing_bursts or p.nav_events or p.cheatsheet_invocations
+                    or p.app_launch_events)
 
     def flush(self) -> bool:
         """Writes all queued rows in one transaction, refreshing daily_rollup
         for every day touched. Returns True if anything was written."""
         pending, self._pending = self._pending, _PendingWrites()
         if not (pending.typing_bursts or pending.nav_events
-                or pending.cheatsheet_invocations):
+                or pending.cheatsheet_invocations or pending.app_launch_events):
             return False
 
         touched_days: set[str] = set()
@@ -177,6 +223,12 @@ class Storage:
                 self._conn.execute(
                     "INSERT INTO cheatsheet_invocations(occurred_at) VALUES (?)",
                     (int(occurred_at),))
+                touched_days.add(_day_key(occurred_at))
+
+            for method, occurred_at in pending.app_launch_events:
+                self._conn.execute(
+                    "INSERT INTO app_launch_events(occurred_at, method) VALUES (?, ?)",
+                    (int(occurred_at), method))
                 touched_days.add(_day_key(occurred_at))
 
             for day in touched_days:
@@ -204,10 +256,18 @@ class Storage:
             "SELECT COUNT(*) FROM cheatsheet_invocations "
             "WHERE occurred_at >= ? AND occurred_at < ?", (start, end)).fetchone()[0]
 
+        app_launch_keybind = self._conn.execute(
+            "SELECT COUNT(*) FROM app_launch_events WHERE occurred_at >= ? "
+            "AND occurred_at < ? AND method = 'keybind'", (start, end)).fetchone()[0]
+        app_launch_panel = self._conn.execute(
+            "SELECT COUNT(*) FROM app_launch_events WHERE occurred_at >= ? "
+            "AND occurred_at < ? AND method = 'panel'", (start, end)).fetchone()[0]
+
         self._conn.execute(
             "INSERT INTO daily_rollup(day, typing_burst_count, typing_keystroke_total, "
             "typing_wpm_avg, typing_wpm_max, nav_keyboard_count, nav_mouse_count, "
-            "cheatsheet_count, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "cheatsheet_count, app_launch_keybind_count, app_launch_panel_count, "
+            "updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(day) DO UPDATE SET "
             "typing_burst_count=excluded.typing_burst_count, "
             "typing_keystroke_total=excluded.typing_keystroke_total, "
@@ -216,9 +276,12 @@ class Storage:
             "nav_keyboard_count=excluded.nav_keyboard_count, "
             "nav_mouse_count=excluded.nav_mouse_count, "
             "cheatsheet_count=excluded.cheatsheet_count, "
+            "app_launch_keybind_count=excluded.app_launch_keybind_count, "
+            "app_launch_panel_count=excluded.app_launch_panel_count, "
             "updated_at=excluded.updated_at",
             (day, burst_count, keystroke_total, wpm_avg, wpm_max,
-             nav_kb, nav_mouse, cheatsheet_count, int(time.time())))
+             nav_kb, nav_mouse, cheatsheet_count, app_launch_keybind,
+             app_launch_panel, int(time.time())))
 
     def _window_days(self, window: str) -> list[str]:
         today = datetime.now().astimezone().date()
@@ -232,10 +295,13 @@ class Storage:
         window = window if window in ("today", "week", "month", "all") else "today"
 
         if window == "all":
-            burst_count, nav_kb, nav_mouse, cheatsheet_count = self._conn.execute(
+            (burst_count, nav_kb, nav_mouse, cheatsheet_count,
+             app_launch_keybind, app_launch_panel) = self._conn.execute(
                 "SELECT COALESCE(SUM(typing_burst_count),0), "
                 "COALESCE(SUM(nav_keyboard_count),0), COALESCE(SUM(nav_mouse_count),0), "
-                "COALESCE(SUM(cheatsheet_count),0) FROM daily_rollup").fetchone()
+                "COALESCE(SUM(cheatsheet_count),0), "
+                "COALESCE(SUM(app_launch_keybind_count),0), "
+                "COALESCE(SUM(app_launch_panel_count),0) FROM daily_rollup").fetchone()
             wpm_avg = self._conn.execute("SELECT AVG(wpm) FROM typing_bursts").fetchone()[0]
             last_row = self._conn.execute(
                 "SELECT wpm FROM typing_bursts ORDER BY ended_at DESC LIMIT 1").fetchone()
@@ -243,10 +309,13 @@ class Storage:
         else:
             days = self._window_days(window)
             placeholders = ",".join("?" for _ in days)
-            burst_count, nav_kb, nav_mouse, cheatsheet_count = self._conn.execute(
+            (burst_count, nav_kb, nav_mouse, cheatsheet_count,
+             app_launch_keybind, app_launch_panel) = self._conn.execute(
                 f"SELECT COALESCE(SUM(typing_burst_count),0), "
                 f"COALESCE(SUM(nav_keyboard_count),0), COALESCE(SUM(nav_mouse_count),0), "
-                f"COALESCE(SUM(cheatsheet_count),0) FROM daily_rollup "
+                f"COALESCE(SUM(cheatsheet_count),0), "
+                f"COALESCE(SUM(app_launch_keybind_count),0), "
+                f"COALESCE(SUM(app_launch_panel_count),0) FROM daily_rollup "
                 f"WHERE day IN ({placeholders})", days).fetchone()
             start, _ = _day_bounds(min(days))
             _, end = _day_bounds(max(days))
@@ -259,7 +328,8 @@ class Storage:
             wpm_last = last_row[0] if last_row else None
 
         nav_total = nav_kb + nav_mouse
-        has_data = bool(burst_count or nav_total or cheatsheet_count)
+        applaunch_denom = app_launch_keybind + app_launch_panel
+        has_data = bool(burst_count or nav_total or cheatsheet_count or applaunch_denom)
         mouse_weight = self.mouse_weight()
         nav_denominator = nav_kb + nav_mouse * mouse_weight
         return {
@@ -274,6 +344,10 @@ class Storage:
             "nav_keyboard_pct":
                 round(100 * nav_kb / nav_denominator, 1) if nav_denominator else None,
             "cheatsheet_count": cheatsheet_count,
+            "app_launch_keybind": app_launch_keybind,
+            "app_launch_panel": app_launch_panel,
+            "app_launch_keybind_pct":
+                round(100 * app_launch_keybind / applaunch_denom, 1) if applaunch_denom else None,
         }
 
     def get_daily_history(self, days: int = 14) -> dict:
@@ -289,7 +363,8 @@ class Storage:
         placeholders = ",".join("?" for _ in day_keys)
         rows = {r[0]: r for r in self._conn.execute(
             f"SELECT day, typing_wpm_avg, typing_burst_count, nav_keyboard_count, "
-            f"nav_mouse_count, cheatsheet_count FROM daily_rollup "
+            f"nav_mouse_count, cheatsheet_count, app_launch_keybind_count, "
+            f"app_launch_panel_count FROM daily_rollup "
             f"WHERE day IN ({placeholders})", day_keys).fetchall()}
         mouse_weight = self.mouse_weight()
         series = []
@@ -300,9 +375,11 @@ class Storage:
                     "day": day, "wpm_avg": None, "burst_count": 0,
                     "nav_keyboard": 0, "nav_mouse": 0, "nav_keyboard_pct": None,
                     "cheatsheet_count": 0,
+                    "app_launch_keybind": 0, "app_launch_panel": 0,
                 })
                 continue
-            _, wpm_avg, burst_count, nav_kb, nav_mouse, cheatsheet_count = row
+            (_, wpm_avg, burst_count, nav_kb, nav_mouse, cheatsheet_count,
+             app_launch_keybind, app_launch_panel) = row
             denom = nav_kb + nav_mouse * mouse_weight
             series.append({
                 "day": day,
@@ -312,6 +389,8 @@ class Storage:
                 "nav_mouse": nav_mouse,
                 "nav_keyboard_pct": round(100 * nav_kb / denom, 1) if denom else None,
                 "cheatsheet_count": cheatsheet_count,
+                "app_launch_keybind": app_launch_keybind,
+                "app_launch_panel": app_launch_panel,
             })
         return {"days": days, "mouse_weight": mouse_weight, "series": series}
 
@@ -322,6 +401,8 @@ class Storage:
         self._conn.execute("DELETE FROM nav_events WHERE occurred_at < ?", (cutoff,))
         self._conn.execute(
             "DELETE FROM cheatsheet_invocations WHERE occurred_at < ?", (cutoff,))
+        self._conn.execute(
+            "DELETE FROM app_launch_events WHERE occurred_at < ?", (cutoff,))
         self._conn.execute("VACUUM")
 
     def get_records(self) -> dict:
@@ -355,5 +436,16 @@ class Storage:
             day, kb, mouse = row
             records["best_keyboard_day"] = {
                 "value": round(100 * kb / (kb + mouse), 1), "day": day}
+
+        row = self._conn.execute(
+            "SELECT day, app_launch_keybind_count, app_launch_panel_count FROM daily_rollup "
+            "WHERE app_launch_keybind_count + app_launch_panel_count >= ? "
+            "ORDER BY CAST(app_launch_keybind_count AS REAL) / "
+            "(app_launch_keybind_count + app_launch_panel_count) DESC LIMIT 1",
+            (RECORD_MIN_APPLAUNCH_DAY,)).fetchone()
+        if row:
+            day, kb, panel = row
+            records["best_keybind_launch_day"] = {
+                "value": round(100 * kb / (kb + panel), 1), "day": day}
 
         return records

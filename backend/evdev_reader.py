@@ -4,6 +4,11 @@ Rescans for hot-plugged devices, classifies each event, and immediately
 discards the raw evdev event after classification -- nothing raw is queued or
 persisted. Requires the running user to already be in the `input` group (no
 root/setuid needed to read /dev/input/event*).
+
+Optional audit logging: when `logging_enabled` is True, device discovery and
+classifications are emitted to an `on_log` callback (wired by the daemon to a
+transient in-memory log; nothing is persisted and no raw key codes /
+coordinates are ever exposed -- only classification labels).
 """
 
 from __future__ import annotations
@@ -24,14 +29,97 @@ _MOUSE_BUTTONS = frozenset({
     e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE, e.BTN_SIDE, e.BTN_EXTRA,
 })
 
-# Only deliberate pointer actions count as "mouse navigation": button clicks
-# and wheel scrolls. Pointer *motion* is deliberately excluded -- moving the
-# cursor happens constantly for non-navigation reasons and would swamp the
-# keyboard-vs-mouse split.
+# Only deliberate pointer actions count as "mouse navigation": button clicks,
+# wheel scrolls and two-finger trackpad scrolls. Pointer *motion* is
+# deliberately excluded -- moving the cursor happens constantly for
+# non-navigation reasons and would swamp the keyboard-vs-mouse split.
 _MOUSE_WHEEL = frozenset({
     getattr(e, "REL_WHEEL", 8), getattr(e, "REL_HWHEEL", 11),
     getattr(e, "REL_WHEEL_HI_RES", 12), getattr(e, "REL_HWHEEL_HI_RES", 13),
 })
+
+# Multitouch (protocol B) trackpad axes. A two-finger scroll on a touchpad
+# shows up as >=2 concurrently active ABS_MT tracking slots whose positions
+# move together -- a deliberate scroll/gesture action, analogous to a physical
+# mouse's REL_WHEEL. Single-finger cursor motion is deliberately excluded,
+# consistent with the REL_X/REL_Y exclusion above.
+_ABS_MT_SLOT = getattr(e, "ABS_MT_SLOT", 47)
+_ABS_MT_TRACKING_ID = getattr(e, "ABS_MT_TRACKING_ID", 57)
+_ABS_MT_POSITION_X = getattr(e, "ABS_MT_POSITION_X", 53)
+_ABS_MT_POSITION_Y = getattr(e, "ABS_MT_POSITION_Y", 54)
+_ABS_MT_TRACKING_ID_EMPTY = -1
+
+# A two-finger scroll must accumulate at least this many absolute units of
+# movement before it counts, and each further chunk this size counts again --
+# so both a quick flick and a long drag register, without per-scanline noise.
+SCROLL_THRESHOLD = 40
+
+# Minimum number of concurrent fingers before movement is treated as a
+# deliberate two-finger scroll rather than single-finger cursor motion.
+SCROLL_MIN_FINGERS = 2
+
+
+class TrackpadScrollDetector:
+    """Detects deliberate two-finger scroll gestures from multitouch (protocol
+    B) trackpad events. Returns True from `feed` once a scroll chunk crosses
+    the movement threshold while >=2 fingers are down. Only emits derived
+    signals; raw coordinates are discarded after classification."""
+
+    def __init__(self) -> None:
+        self._slots: dict[int, int] = {}                  # slot -> tracking_id
+        self._positions: dict[int, tuple[int, int]] = {}  # tracking_id -> (x, y)
+        self._seen: dict[int, tuple[bool, bool]] = {}     # tracking_id -> (x_seen, y_seen)
+        self._acc = 0
+        self._active_slot = 0
+
+    def feed(self, code: int, value: int) -> bool:
+        """Process one ABS_MT event. Returns True when a scroll chunk fired."""
+        if code == _ABS_MT_SLOT:
+            self._active_slot = value
+            return False
+
+        if code == _ABS_MT_TRACKING_ID:
+            slot = self._active_slot
+            if value == _ABS_MT_TRACKING_ID_EMPTY:
+                tid = self._slots.pop(slot, None)
+                if tid is not None:
+                    self._positions.pop(tid, None)
+                    self._seen.pop(tid, None)
+                if self._finger_count() < SCROLL_MIN_FINGERS:
+                    self._acc = 0
+                return False
+            self._slots[slot] = value
+            return False
+
+        if code in (_ABS_MT_POSITION_X, _ABS_MT_POSITION_Y):
+            tid = self._slots.get(self._active_slot)
+            if tid is None:
+                return False
+            x, y = self._positions.get(tid, (0, 0))
+            seen_x, seen_y = self._seen.get(tid, (False, False))
+            if code == _ABS_MT_POSITION_X:
+                moved = (value - x) if seen_x else 0  # first reading primes, no delta
+                self._positions[tid] = (value, y)
+                self._seen[tid] = (True, seen_y)
+            else:
+                moved = (value - y) if seen_y else 0
+                self._positions[tid] = (x, value)
+                self._seen[tid] = (seen_x, True)
+            if self._finger_count() < SCROLL_MIN_FINGERS:
+                return False
+            self._acc += moved
+            return self._flush_if_scroll()
+
+        return False
+
+    def _finger_count(self) -> int:
+        return len(self._slots)
+
+    def _flush_if_scroll(self) -> bool:
+        if abs(self._acc) >= SCROLL_THRESHOLD:
+            self._acc = 0
+            return True
+        return False
 
 
 class EvdevSource:
@@ -42,14 +130,29 @@ class EvdevSource:
     def __init__(self, nav_matcher: NavComboMatcher,
                  on_typing_burst: Callable[[TypingBurst], None],
                  on_mouse_activity: Callable[[float], None],
-                 on_keyboard_nav_combo: Callable[[float], None]):
+                 on_keyboard_nav_combo: Callable[[float], None],
+                 on_app_launch_keybind_combo: Callable[[float], None],
+                 on_panel_launch_combo: Callable[[float], None],
+                 on_cheatsheet_combo: Callable[[float], None],
+                 logging_enabled: bool = False,
+                 on_log: Callable[[str], None] | None = None):
         self._nav_matcher = nav_matcher
         self._on_typing_burst = on_typing_burst
         self._on_mouse_activity = on_mouse_activity
         self._on_keyboard_nav_combo = on_keyboard_nav_combo
+        self._on_app_launch_keybind_combo = on_app_launch_keybind_combo
+        self._on_panel_launch_combo = on_panel_launch_combo
+        self._on_cheatsheet_combo = on_cheatsheet_combo
+        self.logging_enabled = logging_enabled
+        self._on_log = on_log
         self._typing = TypingTracker()
         self._stop = False
         self._devices: dict[str, asyncio.Task] = {}
+        self._trackpads: dict[str, TrackpadScrollDetector] = {}
+
+    def _log(self, msg: str) -> None:
+        if self.logging_enabled and self._on_log is not None:
+            self._on_log(msg)
 
     def stop(self) -> None:
         self._stop = True
@@ -80,31 +183,58 @@ class EvdevSource:
             try:
                 device = evdev.InputDevice(path)
                 capabilities = device.capabilities()
+                name = device.name
             except OSError:
                 continue
             if e.EV_KEY not in capabilities and e.EV_REL not in capabilities:
                 device.close()
                 continue
+            has_mt = (e.EV_ABS in capabilities and
+                      _ABS_MT_POSITION_X in capabilities.get(e.EV_ABS, {}))
+            if has_mt:
+                self._trackpads[path] = TrackpadScrollDetector()
+                self._log(f"device:{path} name={name!r} trackpad(yes)")
+            else:
+                self._log(f"device:{path} name={name!r}")
             self._devices[path] = asyncio.create_task(self._read_device(path, device))
 
     async def _read_device(self, path: str, device) -> None:
         try:
             async for event in device.async_read_loop():
-                self._handle_event(event)
+                self._handle_event(event, path)
         except (OSError, asyncio.CancelledError):
             pass
         finally:
             self._devices.pop(path, None)
+            self._trackpads.pop(path, None)
             try:
                 device.close()
             except OSError:
                 pass
 
-    def _handle_event(self, event) -> None:
+    def _handle_event(self, event, path: str | None = None) -> None:
         if event.type == e.EV_KEY:
+            if path is not None:
+                if event.code in _MOUSE_BUTTONS and event.value == 1:
+                    self._log(f"device:{path} mouse:click")
+                else:
+                    self._log(f"device:{path} key")
             self._handle_key(event.code, event.value, time.monotonic(), time.time())
         elif event.type == e.EV_REL:
+            if path is not None and event.code in _MOUSE_WHEEL:
+                self._log(f"device:{path} mouse:wheel")
             self._handle_motion(event.code, event.value, time.monotonic())
+        elif event.type == e.EV_ABS:
+            trackpad = self._trackpads.get(path) if path else None
+            if trackpad is None and path is not None:
+                # Lazy registration: a device emitting ABS_MT axes not yet
+                # seen by _rescan (or driven directly in tests) is treated as
+                # a trackpad without needing a capabilities round-trip here.
+                trackpad = TrackpadScrollDetector()
+                self._trackpads[path] = trackpad
+            if trackpad is not None and trackpad.feed(event.code, event.value):
+                self._log(f"device:{path} mouse:trackpad-scroll")
+                self._on_mouse_activity(time.monotonic())
 
     def _handle_key(self, code: int, value: int, now: float, wall: float) -> None:
         if code in _MOUSE_BUTTONS:
@@ -113,8 +243,17 @@ class EvdevSource:
             return
 
         is_modifier = self._nav_matcher.on_modifier_event(code, pressed=value in (1, 2))
-        if value == 1 and not is_modifier and self._nav_matcher.matches(code):
-            self._on_keyboard_nav_combo(now)
+        if value == 1 and not is_modifier:
+            if self._nav_matcher.matches(code):
+                self._on_keyboard_nav_combo(now)
+            if self._nav_matcher.matches_app_launch(code):
+                self._on_app_launch_keybind_combo(now)
+            if self._nav_matcher.matches_panel_launch(code):
+                self._on_panel_launch_combo(now)
+            if self._nav_matcher.matches_cheatsheet(code):
+                # wall-clock timestamp: this one goes straight to storage,
+                # unlike the nav channels which correlate in monotonic time.
+                self._on_cheatsheet_combo(wall)
 
         burst = self._typing.on_key_event(code, value, now, wall)
         if burst is not None:

@@ -37,6 +37,8 @@ BarWidget {
 
   readonly property var stats: backend.lastStats
   readonly property bool hasData: !!(stats && stats.has_data)
+  readonly property bool loggingEnabled: backend.loggingEnabled
+  readonly property var logLines: backend.lastLog
   readonly property real wpmAvg: (stats && stats.wpm_avg !== null && stats.wpm_avg !== undefined)
     ? Number(stats.wpm_avg) : 0
   readonly property real wpmLast: (stats && stats.wpm_last !== null && stats.wpm_last !== undefined)
@@ -46,6 +48,9 @@ BarWidget {
   readonly property real mouseWeight: stats ? Number(stats.mouse_weight || 1.0) : 1.0
   readonly property var navKeyboardPct: stats ? stats.nav_keyboard_pct : null
   readonly property int cheatsheetCount: stats ? Number(stats.cheatsheet_count || 0) : 0
+  readonly property int appLaunchKeybindCount: stats ? Number(stats.app_launch_keybind || 0) : 0
+  readonly property int appLaunchPanelCount: stats ? Number(stats.app_launch_panel || 0) : 0
+  readonly property var appLaunchKeybindPct: stats ? stats.app_launch_keybind_pct : null
 
   readonly property string compactLabel: Fmt.formatCompactLabel(
     backend.connected, hasData, wpmAvg, navKeyboardPct)
@@ -54,7 +59,9 @@ BarWidget {
   onOpenedChanged: if (opened) {
     backend.requestRecords()
     backend.requestHistory(14)
+    backend.requestLog()
   }
+  onLoggingEnabledChanged: if (root.loggingEnabled) backend.requestLog()
 
   BackendClient {
     id: backend
@@ -100,8 +107,18 @@ BarWidget {
         mouseWeight: root.mouseWeight
         navKeyboardPct: root.navKeyboardPct
         cheatsheetCount: root.cheatsheetCount
+        appLaunchKeybindCount: root.appLaunchKeybindCount
+        appLaunchPanelCount: root.appLaunchPanelCount
+        appLaunchKeybindPct: root.appLaunchKeybindPct
         records: backend.lastRecords
         history: backend.lastHistory
+        loggingEnabled: root.loggingEnabled
+        logLines: root.logLines
+        onToggleLogging: {
+          backend.setLogging(!root.loggingEnabled)
+          backend.requestLog()
+        }
+        onRefreshLog: backend.requestLog()
       }
     }
   }
