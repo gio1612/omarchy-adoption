@@ -14,7 +14,7 @@
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
-REPO_ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+REPO_ROOT=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 
 manifest_version=$(python3 -c \
   "import json;print(json.load(open('$REPO_ROOT/manifest.json'))['version'])")

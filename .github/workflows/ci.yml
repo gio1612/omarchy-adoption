@@ -90,6 +90,13 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             qt6-declarative-dev-tools qml6-module-qtquick
 
+      - name: Locate qmllint
+        # Ubuntu keeps Qt6 tools out of PATH; print what we found so a future
+        # packaging change is diagnosable from the log alone.
+        run: |
+          dpkg -L qt6-declarative-dev-tools | grep -i qmllint || true
+          ls -l /usr/lib/qt6/bin/ 2>/dev/null | grep -i qml || true
+
       - name: Fetch the Omarchy shell type definitions
         run: git clone --depth 1 https://github.com/basecamp/omarchy.git "$RUNNER_TEMP/omarchy"
 

@@ -87,6 +87,12 @@ with only a line in the journal to show for it. The linter catches exactly
 that, but only because it resolves `qs.Ui` / `qs.Commons` against a real
 Omarchy shell tree. CI shallow-clones `basecamp/omarchy` to get one.
 
+It fails the build **only** on load-blocking diagnostics (`missing-property`,
+`missing-type`, `missing-enum`, syntax errors); everything else prints as
+advisory. qmllint's advisory set shifts between Qt releases — a dev box on
+6.11 and an ubuntu-latest runner on 6.4 disagree — so a zero-warning gate
+fails for reasons unrelated to this plugin. Don't "tighten" it back.
+
 Prefer the shell's own `qs.Ui` components (`BorderSurface`, `Button`,
 `ToggleSwitch`, `PanelSectionHeader`, `PanelSeparator`, `PanelActionButton`,
 `WidgetButton`) over hand-rolled `Rectangle`s. Every one of those hand-rolled

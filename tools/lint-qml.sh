@@ -18,15 +18,29 @@
 #   OMARCHY_SHELL_DIR=/path/to/omarchy/shell ./tools/lint-qml.sh
 #
 # In CI that tree comes from a shallow clone of basecamp/omarchy.
+#
+# WHAT FAILS THE BUILD
+# --------------------
+# Only the diagnostics that mean "this file will not load in the shell":
+# syntax errors, and the `missing-property` / `missing-type` / `missing-enum`
+# families. Everything else is printed as advisory and does not fail.
+#
+# That distinction is deliberate. qmllint's warning set changes between Qt
+# releases -- a developer machine on Qt 6.11 and an ubuntu-latest runner on
+# Qt 6.4 do not agree on the advisory categories -- so gating on "zero
+# warnings" makes the check fail for reasons that have nothing to do with this
+# plugin. The load-blocking categories are stable, and are the ones that would
+# have caught the bug above.
 # ---------------------------------------------------------------------------
 set -uo pipefail
 
-REPO_ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+REPO_ROOT=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 SHELL_DIR="${OMARCHY_SHELL_DIR:-/usr/share/omarchy/shell}"
 
 QMLLINT="${QMLLINT:-}"
 if [[ -z $QMLLINT ]]; then
-  for candidate in qmllint qmllint6 /usr/lib/qt6/bin/qmllint /usr/lib/qt6/bin/qmllint6; do
+  for candidate in qmllint qmllint6 /usr/lib/qt6/bin/qmllint \
+                   /usr/lib/qt6/bin/qmllint6 /usr/lib/qt6/libexec/qmllint; do
     if command -v "$candidate" >/dev/null 2>&1; then QMLLINT=$candidate; break; fi
   done
 fi
@@ -42,29 +56,35 @@ if [[ ! -d $SHELL_DIR/Ui || ! -d $SHELL_DIR/Commons ]]; then
   exit 127
 fi
 
+echo "lint-qml: $QMLLINT ($("$QMLLINT" --version 2>&1 | head -1))"
+echo "lint-qml: shell types from $SHELL_DIR"
+
 # Quickshell exposes the shell tree under the `qs` module prefix, so qmllint
 # needs an import root that *contains* a directory named `qs`.
 IMPORT_ROOT=$(mktemp -d)
 trap 'rm -rf "$IMPORT_ROOT"' EXIT
 ln -s "$SHELL_DIR" "$IMPORT_ROOT/qs"
 
-# Known qmllint limitations that the Omarchy shell's own sources trip too --
-# verified by running qmllint over shell/Ui/Toggle.qml, which reports the same
-# things. Filtering these by MESSAGE TEXT (not by category) is deliberate: the
-# `missing-property` category is exactly what catches a bad property
-# assignment, so the category must stay live.
+# Diagnostics that mean the file will not load. These fail the build.
+FATAL_RE='\[(missing-property|missing-type|missing-enum)\]|^Error:'
+
+# Known-good noise, excluded even from the fatal set. Each of these is
+# reproduced by the Omarchy shell's OWN sources -- verified by running qmllint
+# over shell/Ui/Toggle.qml -- so they are qmllint limitations, not defects:
 #
 #   * 'not found on type "QObject"' -- Style.font / Style.spacing are inline
 #     `QtObject { ... }` sub-objects, which qmllint types as bare QObject and
-#     therefore cannot see the tokens inside.
-#   * 'Unqualified access' -- referring to an outer id from inside a
-#     Component, which is legal and used throughout the shell.
-#   * 'inheritance cycle' / 'not resolved' for BarWidget -- our BarWidget.qml
-#     extends the shell type of the same name, which confuses the resolver.
+#     therefore cannot see the tokens inside. This is a `missing-property`,
+#     which is why it has to be excluded by MESSAGE rather than by category.
+#   * BarWidget -- our BarWidget.qml extends the shell type of the same name,
+#     which the resolver reads as an inheritance cycle.
+#   * 'Unqualified access' -- referring to an outer id from inside a Component
+#     or a Repeater delegate. Legal QML, used throughout the shell's own code.
 #   * Quickshell's own C++ types are not introspectable from qmllint.
-IGNORE_RE='not found on type "QObject"|Unqualified access|inheritance-cycle|is part of an inheritance cycle|Type BarWidget is used but it is not resolved|Quickshell|QLocalSocket|signal-handler-parameters|unknown grouped property scope anchors'
+IGNORE_RE='not found on type "QObject"|Unqualified access|inheritance cycle|Type BarWidget is used but it is not resolved|Quickshell|QLocalSocket'
 
 status=0
+advisory=0
 shopt -s nullglob
 files=("$REPO_ROOT"/*.qml)
 if (( ${#files[@]} == 0 )); then
@@ -73,20 +93,29 @@ if (( ${#files[@]} == 0 )); then
 fi
 
 for f in "${files[@]}"; do
-  # -I . so sibling plugin components (SplitBar, Sparkline, ...) resolve.
-  out=$("$QMLLINT" -I "$IMPORT_ROOT" -I "$REPO_ROOT" "$f" 2>&1 \
-        | grep -E '^(Error|Warning)' \
-        | grep -Ev "$IGNORE_RE")
-  if [[ -n $out ]]; then
-    echo "--- $(basename "$f")"
-    echo "$out"
+  raw=$("$QMLLINT" -I "$IMPORT_ROOT" -I "$REPO_ROOT" "$f" 2>&1 \
+        | grep -E '^(Error|Warning)' | grep -Ev "$IGNORE_RE")
+  [[ -z $raw ]] && continue
+
+  fatal=$(echo "$raw" | grep -E "$FATAL_RE")
+  if [[ -n $fatal ]]; then
+    echo "FAIL $(basename "$f")"
+    echo "$fatal" | sed 's/^/     /'
     status=1
+  fi
+
+  rest=$(echo "$raw" | grep -Ev "$FATAL_RE")
+  if [[ -n $rest ]]; then
+    advisory=$((advisory + $(echo "$rest" | wc -l)))
+    echo "note $(basename "$f")"
+    echo "$rest" | sed 's/^/     /'
   fi
 done
 
+echo
 if (( status == 0 )); then
-  echo "lint-qml: ${#files[@]} file(s) clean against $SHELL_DIR"
+  echo "lint-qml: OK -- ${#files[@]} file(s), no load-blocking diagnostics${advisory:+ ($advisory advisory)}"
 else
-  echo "lint-qml: FAILED -- see above" >&2
+  echo "lint-qml: FAILED -- load-blocking diagnostics above" >&2
 fi
 exit $status

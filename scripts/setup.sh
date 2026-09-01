@@ -25,7 +25,7 @@
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
-source_root=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+source_root=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 slug="omarchy-adoption-tracker"
 
 check_only=false
@@ -59,10 +59,27 @@ if ! python3 -c 'import venv' >/dev/null 2>&1; then
 fi
 
 # Reading /dev/input/event* needs group membership, never root or setuid.
-if ! id -nG "$USER" 2>/dev/null | tr ' ' '\n' | grep -qx input; then
+#
+# Two separate facts, and conflating them is genuinely confusing:
+#   * the group DATABASE   -- `id -nG "$USER"`, what usermod edits
+#   * this SESSION's creds -- `id -nG`, stamped at login and never refreshed
+# `usermod -aG input` updates the first immediately and the second not at all,
+# so a user who has "already done it" still measures nothing until they log
+# out and back in. Report those two states differently.
+in_group_db=false
+in_session=false
+id -nG "$USER" 2>/dev/null | tr ' ' '\n' | grep -qx input && in_group_db=true
+id -nG          2>/dev/null | tr ' ' '\n' | grep -qx input && in_session=true
+
+if ! $in_group_db; then
   note_problem "$USER is not in the 'input' group (needed to read /dev/input/event*).
   Run:  sudo usermod -aG input $USER
   then log out and back in, and re-run this script."
+elif ! $in_session; then
+  note_problem "$USER is in the 'input' group, but this login session predates it.
+  Group membership is stamped at login, so nothing running right now -- including
+  systemd --user and the tracker daemon -- can read /dev/input/event*.
+  Log out and back in (or reboot), then re-run this script."
 fi
 
 # A user service needs a running `systemd --user` instance.

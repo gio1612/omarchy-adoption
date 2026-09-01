@@ -27,7 +27,7 @@
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
-SOURCE_ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+SOURCE_ROOT=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 ID=$(python3 -c "import json,sys; print(json.load(open('$SOURCE_ROOT/manifest.json'))['id'])" 2>/dev/null || echo "io.github.gio1612.omarchy-adoption")
 SLUG="omarchy-adoption-tracker"
 
