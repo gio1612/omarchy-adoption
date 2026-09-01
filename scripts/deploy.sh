@@ -55,10 +55,12 @@ if [[ -d "$PLUGIN_DIR" ]]; then
   if $DRY_RUN; then
     echo "[dry-run] would copy root sources: ${files//$'\n'/ }"
   else
+    # `ls` above already expanded the globs; re-globbing here with nullglob
+    # off would have copied a literal "*.qml" if a pattern matched nothing.
     while IFS= read -r f; do
       [[ -z "$f" ]] && continue
       install -m 644 -- "$SOURCE_ROOT/$f" "$PLUGIN_DIR/$f"
-    done < <(cd "$SOURCE_ROOT" && printf '%s\n' *.qml *.js *.json)
+    done <<< "$files"
     echo "deploy: synced root sources -> $PLUGIN_DIR"
   fi
 

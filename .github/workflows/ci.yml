@@ -1,0 +1,155 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+    tags-ignore: ["**"]
+  pull_request:
+  workflow_call:      # reused by release.yml so a tag can't ship an untested tree
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # -------------------------------------------------------------- back end
+  python:
+    name: pytest (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install build deps for python-evdev
+        # evdev compiles against linux/input.h from linux-libc-dev.
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends linux-libc-dev
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r tests/requirements.txt
+
+      - name: Run tests
+        run: python -m pytest tests/ -q
+
+  lint-python:
+    name: ruff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install ruff
+      # `ruff check` only. No `ruff format` gate: this codebase uses a
+      # consistent hanging-indent style throughout, and switching to ruff's
+      # formatter would rewrite every file for no behavioural gain.
+      - name: Lint
+        run: ruff check backend tests tools
+
+  # ------------------------------------------------------------- shell scripts
+  lint-shell:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends shellcheck
+      - name: Syntax check
+        run: for f in scripts/*.sh tools/*.sh; do bash -n "$f"; done
+      - name: shellcheck
+        run: shellcheck --severity=warning scripts/*.sh tools/*.sh
+
+  # ------------------------------------------------------------------- QML
+  #
+  # The one check that would have caught the bug that took the widget offline:
+  # `borderSpec` assigned to a plain Rectangle. qmllint can only see that if it
+  # can resolve qs.Ui / qs.Commons, which means it needs a real Omarchy shell
+  # tree -- hence the shallow clone below.
+  qml:
+    name: qmllint (against Omarchy shell)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Qt QML tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qt6-declarative-dev-tools qml6-module-qtquick
+
+      - name: Fetch the Omarchy shell type definitions
+        run: git clone --depth 1 https://github.com/basecamp/omarchy.git "$RUNNER_TEMP/omarchy"
+
+      - name: Lint QML
+        env:
+          OMARCHY_SHELL_DIR: ${{ runner.temp }}/omarchy/shell
+        run: ./tools/lint-qml.sh
+
+  # ------------------------------------------------------------ plugin manifest
+  plugin:
+    name: omarchy plugin validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends jq
+
+      - name: Fetch Omarchy's own plugin validator
+        run: git clone --depth 1 https://github.com/basecamp/omarchy.git "$RUNNER_TEMP/omarchy"
+
+      - name: Validate manifest against the shell's schema
+        # Run against a clean git export: the validator rejects symlinks
+        # anywhere in the plugin folder, and a working tree can carry a .venv.
+        run: |
+          mkdir -p "$RUNNER_TEMP/export"
+          git archive HEAD | tar -x -C "$RUNNER_TEMP/export"
+          bash "$RUNNER_TEMP/omarchy/bin/omarchy-plugin-validate" "$RUNNER_TEMP/export"
+
+      - name: Version consistency (manifest.json vs DAEMON_VERSION)
+        run: ./tools/check-version.sh
+
+      - name: Entry points exist in a clean checkout
+        run: |
+          test -f "$RUNNER_TEMP/export/BarWidget.qml"
+          test -f "$RUNNER_TEMP/export/manifest.json"
+          test -f "$RUNNER_TEMP/export/scripts/setup.sh"
+          test -f "$RUNNER_TEMP/export/backend/daemon.py"
+
+  # ---------------------------------------------- install-flow smoke (no shell)
+  install-smoke:
+    name: setup.sh dry-run + daemon boots
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends linux-libc-dev
+      - run: python -m pip install -r backend/requirements.txt
+
+      - name: setup.sh --check refuses cleanly without an input group
+        # The runner is not in the `input` group and has no systemd --user
+        # session, so a full install cannot work here. --check must say so and
+        # exit non-zero rather than half-installing.
+        run: |
+          if bash scripts/setup.sh --check; then
+            echo "expected --check to fail on a CI runner" >&2
+            exit 1
+          fi
+
+      - name: Daemon starts, answers over its socket, and stops cleanly
+        run: python tools/smoke_daemon.py

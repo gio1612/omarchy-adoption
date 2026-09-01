@@ -55,6 +55,16 @@ def socket2_path(runtime_dir: str | None = None,
     return path if os.path.exists(path) else None
 
 
+async def _close_writer(writer: asyncio.StreamWriter | None) -> None:
+    if writer is None:
+        return
+    try:
+        writer.close()
+        await writer.wait_closed()
+    except (OSError, ConnectionError, RuntimeError):
+        pass
+
+
 class HyprSocketClient:
     """Connects to Hyprland's socket2 and dispatches nav / config-reload /
     openwindow events. Reconnects with backoff on compositor restart so a
@@ -78,8 +88,9 @@ class HyprSocketClient:
             if not path:
                 await asyncio.sleep(RECONNECT_MAX_S)
                 continue
+            writer = None
             try:
-                reader, _writer = await asyncio.open_unix_connection(path)
+                reader, writer = await asyncio.open_unix_connection(path)
                 # When auto-started at login before Hyprland exports its env
                 # to systemd --user, this daemon won't have the signature.
                 # Now that we know it's live, set it so child processes
@@ -92,6 +103,11 @@ class HyprSocketClient:
                 await self._read_loop(reader)
             except (OSError, ConnectionError):
                 pass
+            finally:
+                # Every reconnect used to abandon its transport here. Over a
+                # session with repeated Hyprland restarts that leaked one
+                # socket + transport per attempt.
+                await _close_writer(writer)
             if self._stop:
                 return
             await asyncio.sleep(backoff)

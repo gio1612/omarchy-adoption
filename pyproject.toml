@@ -1,0 +1,42 @@
+# Tooling config only -- this repo is an Omarchy plugin, not a Python package.
+# The daemon is installed by scripts/setup.sh into a plain venv, so there is
+# deliberately no [project] table and nothing to `pip install .`.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# conftest.py at the repo root puts backend/ on sys.path.
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = [".venv", "__pycache__"]
+
+[tool.ruff.lint]
+select = [
+  "E",    # pycodestyle
+  "F",    # pyflakes
+  "W",    # warnings
+  "I",    # import sorting
+  "UP",   # pyupgrade
+  "B",    # bugbear
+  "C4",   # comprehensions
+  "SIM",  # simplify
+  "BLE",  # blind except -- selected on purpose, see below
+  "RUF",
+]
+ignore = [
+  # Long explanatory comments are load-bearing in this codebase.
+  "E501",
+]
+# BLE001 stays ON. The daemon does catch broad exceptions, but only at its
+# outer boundaries (client handler, periodic loops, self-test) where a handler
+# bug must cost one request rather than the whole service -- that is the
+# crash-loop this refactor was about. Every such site carries an explicit
+# `# noqa: BLE001` saying why, so a NEW blind except cannot slip in unnoticed.
+
+[tool.ruff.lint.per-file-ignores]
+# Tests reach into private attributes on purpose to drive the daemon's
+# internals without a real socket.
+"tests/*" = ["SLF001"]
+"tools/*" = ["SLF001"]

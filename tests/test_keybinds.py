@@ -1,7 +1,6 @@
 import json
 
 from evdev import ecodes as e
-
 from keybinds import NavComboMatcher, parse_binds_json
 
 

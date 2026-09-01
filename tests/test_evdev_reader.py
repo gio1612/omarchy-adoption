@@ -1,6 +1,5 @@
-from evdev import ecodes as e
-
 import evdev_reader as mod
+from evdev import ecodes as e
 from evdev_reader import EvdevSource
 from keybinds import NavComboMatcher
 
@@ -154,6 +153,9 @@ def _scenario_source():
 
 
 def _feed_abs(source, path, events):
+    # Real devices are enrolled by EvdevSource._discover after a capability
+    # check; driving _handle_event directly means doing that enrollment here.
+    source.register_trackpad(path)
     for type_, code, value in events:
         source._handle_event(FakeEvent(type_, code, value), path)
 
@@ -252,11 +254,11 @@ def test_logging_reports_mouse_click_wheel_and_trackpad():
         on_log=logged.append,
     )
     source._handle_event(FakeEvent(e.EV_KEY, e.BTN_LEFT, 1), "/dev/input/eventCmd")
-    assert any("mouse:click" in l for l in logged)
+    assert any("mouse:click" in line for line in logged)
     source._handle_event(FakeEvent(e.EV_REL, e.REL_WHEEL, -1), "/dev/input/eventCmd")
-    assert any("mouse:wheel" in l for l in logged)
+    assert any("mouse:wheel" in line for line in logged)
     _two_finger_scroll(source, "/dev/input/eventPad", from_y=100, to_y=400, steps=8)
-    assert any("trackpad-scroll" in l for l in logged)
+    assert any("trackpad-scroll" in line for line in logged)
 
 
 def test_logging_reports_keyboard_keystrokes():
@@ -277,5 +279,53 @@ def test_logging_reports_keyboard_keystrokes():
     )
     source._handle_event(FakeEvent(e.EV_KEY, e.KEY_A, 1), "/dev/input/eventKB")
     source._handle_event(FakeEvent(e.EV_KEY, e.KEY_A, 0), "/dev/input/eventKB")
-    assert any("key" in l for l in logged)
-    assert not any("mouse:click" in l for l in logged)
+    assert any("key" in line for line in logged)
+    assert not any("mouse:click" in line for line in logged)
+
+
+# ---------------------------------------------------------------------------
+# Trackpad enrollment is explicit
+# ---------------------------------------------------------------------------
+
+def test_abs_events_from_an_unregistered_device_are_ignored():
+    """Regression: _handle_event used to create a scroll detector for ANY
+    device that emitted an EV_ABS event, which quietly enrolled graphics
+    tablets, joysticks and lid switches as trackpads. Only devices whose
+    capabilities advertise ABS_MT_POSITION_X are enrolled now."""
+    source, calls = _scenario_source()
+    S, T, Y = mod._ABS_MT_SLOT, mod._ABS_MT_TRACKING_ID, mod._ABS_MT_POSITION_Y
+    X = mod._ABS_MT_POSITION_X
+    events = [
+        (e.EV_ABS, S, 0), (e.EV_ABS, T, 100), (e.EV_ABS, X, 10), (e.EV_ABS, Y, 100),
+        (e.EV_ABS, S, 1), (e.EV_ABS, T, 200), (e.EV_ABS, X, 30), (e.EV_ABS, Y, 100),
+    ]
+    for y in range(120, 601, 20):
+        events += [(e.EV_ABS, S, 0), (e.EV_ABS, Y, y),
+                   (e.EV_ABS, S, 1), (e.EV_ABS, Y, y)]
+
+    # NOT registered as a trackpad
+    for type_, code, value in events:
+        source._handle_event(FakeEvent(type_, code, value), "/dev/input/eventTablet")
+
+    assert calls["mouse"] == []
+    assert "/dev/input/eventTablet" not in source._trackpads
+
+
+def test_register_trackpad_is_idempotent():
+    source, _ = _scenario_source()
+    first = source.register_trackpad("/dev/input/eventTP")
+    assert source.register_trackpad("/dev/input/eventTP") is first
+
+
+def test_health_starts_empty_and_counts_registered_devices():
+    source, _ = _scenario_source()
+    assert source.health() == {"readable": 0, "blocked": 0, "total": 0, "keyboards": 0}
+
+
+def test_keyboard_probe_keys_are_real_codes():
+    """A typo here would silently classify every keyboard as 'not a keyboard'
+    and make the input-access warning fire on a perfectly healthy system."""
+    for code in mod._KEYBOARD_PROBE_KEYS:
+        assert isinstance(code, int) and code > 0
+    assert e.KEY_A in mod._KEYBOARD_PROBE_KEYS
+    assert e.KEY_SPACE in mod._KEYBOARD_PROBE_KEYS

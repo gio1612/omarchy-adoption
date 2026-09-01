@@ -16,6 +16,7 @@ than guessing.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import re
 
@@ -103,14 +104,28 @@ _SPECIAL_NAMES = {
 EVDEV_TO_HYPR_KEYNAME: dict[int, str] = {**_LETTER_NAMES, **_DIGIT_NAMES, **_SPECIAL_NAMES}
 
 
-async def fetch_keybind_allowlists() -> dict[str, set[tuple[int, str]]]:
+# `hyprctl binds -j` is a local IPC round-trip that normally answers in
+# milliseconds. Bounded anyway: this is awaited from the Hyprland event read
+# loop, so a wedged hyprctl would otherwise stall every nav event behind it.
+HYPRCTL_TIMEOUT_S = 5.0
+
+
+async def fetch_keybind_allowlists(
+        timeout_s: float = HYPRCTL_TIMEOUT_S) -> dict[str, set[tuple[int, str]]]:
     """Runs `hyprctl binds -j` once and returns all four live allowlists
     (nav / app-launch / panel-launch / cheatsheet), each a set of
-    (modmask, KEY) pairs."""
+    (modmask, KEY) pairs. Raises OSError if hyprctl is missing, or
+    asyncio.TimeoutError if it does not answer in time."""
     proc = await asyncio.create_subprocess_exec(
         "hyprctl", "binds", "-j",
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-    stdout, _ = await proc.communicate()
+    try:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout_s)
+    except TimeoutError:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        await proc.wait()
+        raise
     return parse_binds_json(stdout.decode("utf-8", errors="replace"))
 
 
@@ -155,9 +170,7 @@ def parse_binds_json(raw: str) -> dict[str, set[tuple[int, str]]]:
             continue
 
         combo = (modmask, key.upper())
-        if dispatcher in NAV_DISPATCHERS:
-            result["nav"].add(combo)
-        elif dispatcher == LUA_DISPATCHER and _is_nav_description(description):
+        if dispatcher in NAV_DISPATCHERS or (dispatcher == LUA_DISPATCHER and _is_nav_description(description)):
             result["nav"].add(combo)
         elif dispatcher == LUA_DISPATCHER and description in APP_LAUNCH_DESCRIPTIONS:
             result["app_launch"].add(combo)

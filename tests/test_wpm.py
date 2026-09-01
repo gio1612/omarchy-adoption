@@ -1,5 +1,4 @@
 from evdev import ecodes as e
-
 from wpm import TypingTracker, compute_wpm
 
 

@@ -3,8 +3,7 @@ import time
 from datetime import datetime, timedelta
 
 import pytest
-
-from storage import Storage
+from storage import Storage, StorageClosed
 from wpm import TypingBurst
 
 
@@ -468,3 +467,111 @@ def test_migrate_schema_adds_app_launch_columns_to_existing_db(tmp_path):
     # reopening again is a no-op (idempotent, no error)
     reopened = Storage(db_path)
     reopened.close()
+
+
+# ---------------------------------------------------------------------------
+# Retention sweep + closed-storage guard
+# ---------------------------------------------------------------------------
+
+def test_prune_removes_only_rows_past_retention(tmp_path):
+    store = Storage(str(tmp_path / "t.db"))
+    now = time.time()
+    old = now - 200 * 86400
+    store.queue_nav_event("keyboard", old)
+    store.queue_nav_event("mouse", now)
+    store.queue_cheatsheet_invocation(old)
+    store.flush()
+
+    removed = store.prune_old_data(retention_days=90)
+    assert removed == 2
+
+    remaining = store._conn.execute("SELECT COUNT(*) FROM nav_events").fetchone()[0]
+    assert remaining == 1
+    store.close()
+
+
+def test_prune_keeps_the_daily_rollup(tmp_path):
+    """Raw rows age out; the aggregate is what makes long-term trends
+    survive, so it must never be swept."""
+    store = Storage(str(tmp_path / "t.db"))
+    old = time.time() - 200 * 86400
+    store.queue_nav_event("keyboard", old)
+    store.flush()
+    rollups_before = store._conn.execute("SELECT COUNT(*) FROM daily_rollup").fetchone()[0]
+
+    store.prune_old_data(retention_days=90)
+
+    rollups_after = store._conn.execute("SELECT COUNT(*) FROM daily_rollup").fetchone()[0]
+    assert rollups_before == rollups_after == 1
+    store.close()
+
+
+def test_prune_if_due_runs_once_per_day(tmp_path):
+    store = Storage(str(tmp_path / "t.db"))
+    old = time.time() - 200 * 86400
+    store.queue_nav_event("keyboard", old)
+    store.queue_nav_event("mouse", old)
+    store.flush()
+
+    assert store.prune_if_due() == 2
+    assert store.prune_if_due() == 0  # same local day -> skipped
+    store.close()
+
+
+def test_prune_skips_vacuum_below_threshold(tmp_path):
+    """VACUUM rewrites the whole file and blocks every other query while it
+    runs -- never worth it for a handful of rows in a desktop daemon."""
+    store = Storage(str(tmp_path / "t.db"))
+    store.queue_nav_event("keyboard", time.time() - 200 * 86400)
+    store.flush()
+
+    executed = []
+    store._conn.set_trace_callback(executed.append)
+    store.prune_old_data(retention_days=90)
+    store._conn.set_trace_callback(None)
+
+    assert executed, "trace callback saw nothing -- the test is not observing"
+    assert not any("VACUUM" in sql.upper() for sql in executed)
+    store.close()
+
+
+def test_prune_vacuums_once_past_the_threshold(tmp_path):
+    store = Storage(str(tmp_path / "t.db"))
+    old = time.time() - 200 * 86400
+    for _ in range(12):
+        store.queue_nav_event("keyboard", old)
+    store.flush()
+
+    executed = []
+    store._conn.set_trace_callback(executed.append)
+    store.prune_old_data(retention_days=90, vacuum_threshold=10)
+    store._conn.set_trace_callback(None)
+
+    assert any("VACUUM" in sql.upper() for sql in executed)
+    store.close()
+
+
+def test_reads_after_close_raise_storage_closed(tmp_path):
+    """Regression: these used to raise sqlite3.ProgrammingError, which
+    escaped the daemon's client handler and crash-looped the service."""
+    store = Storage(str(tmp_path / "t.db"))
+    store.close()
+    for call in (lambda: store.get_stats("today"),
+                 store.get_records,
+                 lambda: store.get_daily_history(7),
+                 store.retention_days,
+                 store.mouse_weight,
+                 store.logging_enabled,
+                 store.flush,
+                 store.prune_old_data):
+        with pytest.raises(StorageClosed):
+            call()
+
+
+def test_queueing_after_close_does_not_raise(tmp_path):
+    """Input callbacks fire from the event loop and cannot know storage just
+    closed; queueing is in-memory only, so it stays safe."""
+    store = Storage(str(tmp_path / "t.db"))
+    store.close()
+    store.queue_nav_event("keyboard", time.time())  # must not raise
+    assert store.has_pending() is True

@@ -39,6 +39,7 @@ BarWidget {
   readonly property bool hasData: !!(stats && stats.has_data)
   readonly property bool loggingEnabled: backend.loggingEnabled
   readonly property var logLines: backend.lastLog
+  readonly property int logTotal: backend.lastLogTotal
   readonly property real wpmAvg: (stats && stats.wpm_avg !== null && stats.wpm_avg !== undefined)
     ? Number(stats.wpm_avg) : 0
   readonly property real wpmLast: (stats && stats.wpm_last !== null && stats.wpm_last !== undefined)
@@ -52,16 +53,29 @@ BarWidget {
   readonly property int appLaunchPanelCount: stats ? Number(stats.app_launch_panel || 0) : 0
   readonly property var appLaunchKeybindPct: stats ? stats.app_launch_keybind_pct : null
 
-  readonly property string compactLabel: Fmt.formatCompactLabel(
-    backend.connected, hasData, wpmAvg, navKeyboardPct)
+  // The daemon reports how much of /dev/input it can actually read. Without
+  // the `input` group it can read almost nothing and measures nothing, so
+  // this gets its own widget state rather than looking like "no data yet".
+  readonly property var inputHealth: stats ? stats.input_health : null
+  readonly property bool inputBlocked: Fmt.inputBlocked(stats)
 
+  readonly property string compactLabel: Fmt.formatCompactLabel(
+    backend.connected, hasData, wpmAvg, navKeyboardPct, inputBlocked)
+
+  // Records and history only change on a day boundary and are only ever
+  // shown in the panel, so they are fetched when it opens rather than kept
+  // live. The audit log is fetched here too so the section is populated the
+  // moment it appears, and then tailed by the panel's own timer.
   onWindowKeyChanged: backend.requestStats(windowKey)
   onOpenedChanged: if (opened) {
     backend.requestRecords()
     backend.requestHistory(14)
-    backend.requestLog()
+    if (root.loggingEnabled) backend.requestLog(root.auditLogLimit)
   }
-  onLoggingEnabledChanged: if (root.loggingEnabled) backend.requestLog()
+  onLoggingEnabledChanged: if (root.loggingEnabled) backend.requestLog(root.auditLogLimit)
+
+  // Matches the daemon's own default `get_log` slice.
+  readonly property int auditLogLimit: 120
 
   BackendClient {
     id: backend
@@ -99,6 +113,8 @@ BarWidget {
         windowKey: root.windowKey
         windowLabel: root.windowLabel
         connectedToDaemon: backend.connected
+        inputBlocked: root.inputBlocked
+        inputHealth: root.inputHealth
         hasData: root.hasData
         wpmAvg: root.wpmAvg
         wpmLast: root.wpmLast
@@ -114,11 +130,9 @@ BarWidget {
         history: backend.lastHistory
         loggingEnabled: root.loggingEnabled
         logLines: root.logLines
-        onToggleLogging: {
-          backend.setLogging(!root.loggingEnabled)
-          backend.requestLog()
-        }
-        onRefreshLog: backend.requestLog()
+        logTotal: root.logTotal
+        onToggleLogging: backend.setLogging(!root.loggingEnabled)
+        onRefreshLog: backend.requestLog(root.auditLogLimit)
       }
     }
   }

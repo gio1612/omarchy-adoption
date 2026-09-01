@@ -2,8 +2,28 @@
 
 // Pure formatting helpers, no state. Shared by BarWidget.qml and StatsPanel.qml.
 
-function formatCompactLabel(connected, hasData, wpmAvg, navKeyboardPct) {
+// Input-access health, straight off the daemon's `input_health` block.
+// Without membership of the `input` group most /dev/input/event* nodes are
+// EACCES: the daemon runs fine and measures absolutely nothing, which reads
+// downstream as an empty widget rather than a permissions problem. These two
+// helpers are what turn that into something the user can act on.
+function inputBlocked(stats) {
+  var health = stats && stats.input_health
+  if (!health) return false
+  return Number(health.keyboards || 0) === 0 && Number(health.blocked || 0) > 0
+}
+
+function formatInputWarning(health) {
+  if (!health) return ""
+  var blocked = Number(health.blocked || 0)
+  var total = Number(health.total || 0)
+  return "Can't read your keyboard: " + blocked + " of " + total
+    + " input devices are permission-denied, so nothing is being measured."
+}
+
+function formatCompactLabel(connected, hasData, wpmAvg, navKeyboardPct, inputBlockedFlag) {
   if (!connected) return "Adoption: offline"
+  if (inputBlockedFlag) return "⚠ no input access"
   if (!hasData) return "No data yet"
   var wpm = Math.round(wpmAvg || 0)
   var navPart = "—"

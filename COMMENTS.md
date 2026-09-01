@@ -41,3 +41,72 @@ never counted as mouse activity.
    discovered device names) readable via the panel / `get_log`. Off by
    default; never persisted; cleared when toggled off. This is how you verify
    the tracker is actually seeing your pointer input.
+
+## Addressed in the 0.2.0 refactor
+
+Reported: "too many bugs, at this moment it is not working, from time to time
+the project freeze."
+
+**Why it wasn't working at all.** Two independent hard failures:
+
+7. **The bar widget didn't load.** `StatsPanel.qml` assigned `borderSpec:` —
+   a `qs.Ui` `BorderSurface` property — to a plain QtQuick `Rectangle`, in two
+   places. The shell reported `Type StatsPanel unavailable` and dropped the
+   whole widget. Fixed, and the hand-rolled chrome that invited it was
+   replaced with the shell's own components. `tools/lint-qml.sh` now catches
+   this class of error before it ships.
+8. **The daemon could not see the keyboard.** This user is not in the `input`
+   group, so 23 of 24 `/dev/input/event*` nodes are permission-denied; the
+   only readable one was a "System Control" node. The daemon ran happily and
+   measured nothing. Worse, `--self-test` passed, because it only checked that
+   *some* device opened. Self-test now requires a readable keyboard, the
+   daemon logs the verdict at startup, and the widget/panel surface it as
+   "⚠ no input access" with the exact fix.
+
+**Why it froze.**
+
+9. **The Debug Audit view rebuilt up to 400 QML `Text` items every second** in
+   an unvirtualized Column, on the UI thread. The daemon now returns a bounded
+   tail (120 lines), the client skips the assignment when nothing changed, the
+   poll dropped to 2s and is gated on visibility, and the view is a `ListView`.
+10. **Derived arrays were recomputed inside bindings.** `Fmt.recordCards(...)`,
+    `Fmt.keyboardTrendBars(...)` etc. were called directly in `model:` and
+    `visible:`, allocating a fresh array each evaluation — and a fresh array as
+    a `Repeater` model rebuilds every delegate. All memoized now.
+11. **The socket client leaked in-flight requests.** `pending` was never
+    cleared on disconnect and was copied on every send, so a long session did
+    quadratic work on a timer. It is now mutated in place, cleared on
+    disconnect, and reaped on timeout. Reconnect backoff went from a 300ms–5s
+    spin to 400ms–30s.
+12. **SQLite ran on the asyncio event loop**, so every flush stalled evdev
+    reads. All storage calls now run on a worker thread behind a lock.
+    Retention pruning — documented but never actually called — now runs once
+    per local day, and only VACUUMs when it frees enough rows to be worth the
+    stall.
+
+**Other real bugs found and fixed.**
+
+13. `sqlite3.ProgrammingError: Cannot operate on a closed database` crash-loop:
+    shutdown closed storage while client handlers were still serving requests.
+    Ordered shutdown + `StorageClosed` + a per-request error boundary.
+14. Shutdown then hung on `server.wait_closed()` (which waits for live
+    handlers) until systemd SIGKILLed it — found by the new smoke test.
+15. Pushed `stats_update` always carried `today`, silently overwriting a panel
+    set to "This week". Each client's window is tracked now.
+16. `hypr_ipc` leaked a socket + transport on every reconnect.
+17. `hyprctl binds -j` was unbounded, and is awaited from the Hyprland event
+    read loop — a wedged hyprctl would stall all nav events. Now 5s-bounded.
+18. Any device emitting `EV_ABS` was lazily enrolled as a trackpad, including
+    tablets and lid switches. Enrollment is capability-checked now.
+19. The panel had no scroll container, so with every section visible the
+    records and Debug Audit sections fell off the bottom unreachably.
+
+**Config hygiene.** `setup.sh` / `uninstall.sh` no longer edit
+`~/.config/hypr/bindings.lua` (or call `hyprctl reload`). See README
+"Upgrading from a pre-0.2 install" for the one-time manual cleanup.
+
+**CI/CD.** `.github/workflows/ci.yml` (pytest on 3.11–3.13, ruff, shellcheck,
+qmllint against a real Omarchy shell, `omarchy plugin validate` on a clean
+export, and an end-to-end daemon smoke test) plus
+`.github/workflows/release.yml` (tag `v*` → re-run CI, verify tag ==
+manifest == `DAEMON_VERSION`, publish release notes).

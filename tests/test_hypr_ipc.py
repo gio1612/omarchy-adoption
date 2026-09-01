@@ -1,8 +1,6 @@
 import asyncio
 import os
 
-import pytest
-
 from hypr_ipc import HyprSocketClient, _newest_live_signature, socket2_path
 
 

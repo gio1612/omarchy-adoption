@@ -8,9 +8,10 @@ or content are never written here.
 from __future__ import annotations
 
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 SCHEMA_VERSION = 1
 DEFAULT_RETENTION_DAYS = 90
@@ -28,6 +29,9 @@ RECORD_MIN_NAV_DAY = 20
 # lower threshold since app launches per day are naturally far fewer than
 # nav events.
 RECORD_MIN_APPLAUNCH_DAY = 5
+# Rows a prune must free before it is worth paying for a VACUUM (which
+# rewrites the whole file and blocks every other query while it runs).
+VACUUM_ROW_THRESHOLD = 5000
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS typing_bursts (
@@ -79,13 +83,20 @@ CREATE TABLE IF NOT EXISTS meta (
 
 
 def _day_key(wall_ts: float) -> str:
-    return datetime.fromtimestamp(wall_ts, tz=timezone.utc).astimezone().strftime("%Y-%m-%d")
+    return datetime.fromtimestamp(wall_ts, tz=UTC).astimezone().strftime("%Y-%m-%d")
 
 
 def _day_bounds(day: str) -> tuple[float, float]:
     """Local-midnight-to-local-midnight epoch bounds for a 'YYYY-MM-DD' day."""
     start = datetime.strptime(day, "%Y-%m-%d").astimezone().timestamp()
     return start, start + 86400
+
+
+class StorageClosed(RuntimeError):
+    """Raised when a read/write arrives after close(). The daemon answers
+    these with a protocol error; before this existed the raw
+    sqlite3.ProgrammingError escaped the client handler and crashed the
+    service on every shutdown that raced an in-flight request."""
 
 
 @dataclass
@@ -98,7 +109,11 @@ class _PendingWrites:
 
 class Storage:
     def __init__(self, db_path: str):
-        self._conn = sqlite3.connect(db_path, isolation_level=None)
+        # check_same_thread=False: the daemon runs every query through a
+        # worker thread (asyncio.to_thread) behind a single lock, so sqlite
+        # never sees concurrent use -- but it does see more than one thread.
+        self._conn = sqlite3.connect(
+            db_path, isolation_level=None, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=2000")
         self._conn.executescript(_SCHEMA)
@@ -108,9 +123,27 @@ class Storage:
         self._ensure_meta("mouse_weight", str(DEFAULT_MOUSE_WEIGHT))
         self._ensure_meta("logging_enabled", "0")
         self._pending = _PendingWrites()
+        # Guards the pending queues only: input callbacks append from the
+        # event-loop thread while flush() drains from a worker thread.
+        self._pending_lock = threading.Lock()
+        self._closed = False
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
 
     def close(self) -> None:
+        """Idempotent. Once closed, every read/write raises StorageClosed
+        rather than sqlite3.ProgrammingError, so callers can answer a late
+        request with a protocol error instead of dying."""
+        if self._closed:
+            return
+        self._closed = True
         self._conn.close()
+
+    def _require_open(self) -> None:
+        if self._closed:
+            raise StorageClosed("storage is closed")
 
     def _migrate_schema(self) -> None:
         """Idempotent migration for columns added to an *existing* table --
@@ -131,12 +164,14 @@ class Storage:
                 "INSERT INTO meta(key, value) VALUES (?, ?)", (key, default_value))
 
     def retention_days(self) -> int:
+        self._require_open()
         cur = self._conn.execute("SELECT value FROM meta WHERE key = 'retention_days'")
         row = cur.fetchone()
         return int(row[0]) if row else DEFAULT_RETENTION_DAYS
 
     def mouse_weight(self) -> float:
         """Calibration weight applied to mouse nav events in the split."""
+        self._require_open()
         cur = self._conn.execute("SELECT value FROM meta WHERE key = 'mouse_weight'")
         row = cur.fetchone()
         try:
@@ -147,10 +182,12 @@ class Storage:
 
     def set_mouse_weight(self, weight: float) -> float:
         """Persist a new calibration weight; returns the clamped value used."""
+        self._require_open()
         try:
             weight = float(weight)
-        except (TypeError, ValueError):
-            raise ValueError(f"mouse_weight must be a number, got {weight!r}")
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"mouse_weight must be a number, got {weight!r}") from exc
         clamped = min(max(weight, MOUSE_WEIGHT_MIN), MOUSE_WEIGHT_MAX)
         self._conn.execute(
             "INSERT INTO meta(key, value) VALUES ('mouse_weight', ?) "
@@ -161,12 +198,14 @@ class Storage:
     def logging_enabled(self) -> bool:
         """Whether the daemon should emit audit log lines for input activity
         (never persisted beyond the boolean -- hw logs are ephemeral only)."""
+        self._require_open()
         cur = self._conn.execute("SELECT value FROM meta WHERE key = 'logging_enabled'")
         row = cur.fetchone()
         return row is not None and row[0] == "1"
 
     def set_logging_enabled(self, enabled: bool) -> bool:
         """Persist the audit-logging flag; returns the value now in effect."""
+        self._require_open()
         enabled = bool(enabled)
         self._conn.execute(
             "INSERT INTO meta(key, value) VALUES ('logging_enabled', ?) "
@@ -178,26 +217,33 @@ class Storage:
     # flush() on a ~2s timer so writes are batched rather than per-event. --
 
     def queue_typing_burst(self, burst) -> None:
-        self._pending.typing_bursts.append(burst)
+        with self._pending_lock:
+            self._pending.typing_bursts.append(burst)
 
     def queue_nav_event(self, method: str, occurred_at: float) -> None:
-        self._pending.nav_events.append((method, occurred_at))
+        with self._pending_lock:
+            self._pending.nav_events.append((method, occurred_at))
 
     def queue_cheatsheet_invocation(self, occurred_at: float) -> None:
-        self._pending.cheatsheet_invocations.append(occurred_at)
+        with self._pending_lock:
+            self._pending.cheatsheet_invocations.append(occurred_at)
 
     def queue_app_launch_event(self, method: str, occurred_at: float) -> None:
-        self._pending.app_launch_events.append((method, occurred_at))
+        with self._pending_lock:
+            self._pending.app_launch_events.append((method, occurred_at))
 
     def has_pending(self) -> bool:
-        p = self._pending
-        return bool(p.typing_bursts or p.nav_events or p.cheatsheet_invocations
-                    or p.app_launch_events)
+        with self._pending_lock:
+            p = self._pending
+            return bool(p.typing_bursts or p.nav_events
+                        or p.cheatsheet_invocations or p.app_launch_events)
 
     def flush(self) -> bool:
         """Writes all queued rows in one transaction, refreshing daily_rollup
         for every day touched. Returns True if anything was written."""
-        pending, self._pending = self._pending, _PendingWrites()
+        self._require_open()
+        with self._pending_lock:
+            pending, self._pending = self._pending, _PendingWrites()
         if not (pending.typing_bursts or pending.nav_events
                 or pending.cheatsheet_invocations or pending.app_launch_events):
             return False
@@ -292,6 +338,7 @@ class Storage:
                 for i in range(span)]
 
     def get_stats(self, window: str) -> dict:
+        self._require_open()
         window = window if window in ("today", "week", "month", "all") else "today"
 
         if window == "all":
@@ -356,6 +403,7 @@ class Storage:
         daily_rollup -- no new writes. Days with no daemon activity that day
         come back as zeroed/null rows rather than being omitted, so callers
         can always zip the series against a fixed-length day axis."""
+        self._require_open()
         days = max(1, min(int(days) if days else 14, self.retention_days()))
         today = datetime.now().astimezone().date()
         day_keys = [(today - timedelta(days=i)).strftime("%Y-%m-%d")
@@ -394,21 +442,63 @@ class Storage:
             })
         return {"days": days, "mouse_weight": mouse_weight, "series": series}
 
-    def prune_old_data(self, retention_days: int | None = None) -> None:
-        retention_days = retention_days if retention_days is not None else self.retention_days()
+    def prune_old_data(self, retention_days: int | None = None,
+                       vacuum_threshold: int = VACUUM_ROW_THRESHOLD) -> int:
+        """Deletes raw per-event rows older than the retention window and
+        returns how many rows went. The daily_rollup aggregate is never
+        pruned, so long-term trends survive.
+
+        VACUUM is skipped unless a meaningful number of rows was freed: it
+        rewrites the whole database file and blocks every other query for as
+        long as that takes, which is exactly the kind of multi-second stall
+        this daemon must never introduce into a desktop session."""
+        self._require_open()
+        retention_days = (retention_days if retention_days is not None
+                          else self.retention_days())
         cutoff = time.time() - retention_days * 86400
-        self._conn.execute("DELETE FROM typing_bursts WHERE ended_at < ?", (cutoff,))
-        self._conn.execute("DELETE FROM nav_events WHERE occurred_at < ?", (cutoff,))
+        removed = 0
+        for table, column in (("typing_bursts", "ended_at"),
+                              ("nav_events", "occurred_at"),
+                              ("cheatsheet_invocations", "occurred_at"),
+                              ("app_launch_events", "occurred_at")):
+            cur = self._conn.execute(
+                f"DELETE FROM {table} WHERE {column} < ?", (cutoff,))
+            removed += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+        if removed >= vacuum_threshold:
+            self._conn.execute("VACUUM")
+        return removed
+
+    def last_prune_day(self) -> str:
+        """'YYYY-MM-DD' of the last prune, or '' if never pruned. Lets the
+        daemon run the sweep at most once per local day instead of on a naive
+        wall-clock timer that restarts with the service."""
+        self._require_open()
+        cur = self._conn.execute(
+            "SELECT value FROM meta WHERE key = 'last_prune_day'")
+        row = cur.fetchone()
+        return str(row[0]) if row and row[0] else ""
+
+    def mark_pruned(self, day: str) -> None:
+        self._require_open()
         self._conn.execute(
-            "DELETE FROM cheatsheet_invocations WHERE occurred_at < ?", (cutoff,))
-        self._conn.execute(
-            "DELETE FROM app_launch_events WHERE occurred_at < ?", (cutoff,))
-        self._conn.execute("VACUUM")
+            "INSERT INTO meta(key, value) VALUES ('last_prune_day', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (day,))
+
+    def prune_if_due(self, now: float | None = None) -> int:
+        """Runs prune_old_data at most once per local day. Returns the number
+        of rows removed (0 when not due)."""
+        today = _day_key(now if now is not None else time.time())
+        if self.last_prune_day() == today:
+            return 0
+        removed = self.prune_old_data()
+        self.mark_pruned(today)
+        return removed
 
     def get_records(self) -> dict:
         """All-time personal bests ('best of the best' KPIs). Daily stats
         reset by construction -- these survive so a great day is never lost.
         Computed on demand; the dataset (90-day retention) stays tiny."""
+        self._require_open()
         records: dict[str, dict] = {}
 
         row = self._conn.execute(

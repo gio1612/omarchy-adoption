@@ -2,20 +2,32 @@
   "schemaVersion": 1,
   "id": "io.github.gio1612.omarchy-adoption",
   "name": "Omarchy Adoption Tracker",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "gio1612",
   "license": "MIT",
   "description": "Local-only typing speed, mouse-vs-keyboard navigation split, and SUPER+K cheatsheet usage. No content is ever stored, no network calls.",
-  "kinds": ["bar-widget"],
-  "entryPoints": { "barWidget": "BarWidget.qml" },
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
   "barWidget": {
     "displayName": "Adoption Tracker",
     "category": "Productivity",
     "allowMultiple": false,
     "defaultSection": "right",
-    "defaults": { "window": "Today" },
+    "defaults": {
+      "window": "Today"
+    },
     "schema": [
-      { "key": "window", "type": "string", "label": "Display window (Today / This week / This month / All-time)" }
+      {
+        "key": "window",
+        "type": "string",
+        "label": "Display window (Today / This week / This month / All-time)"
+      }
     ]
-  }
+  },
+  "repository": "https://github.com/gio1612/omarchy-adoption",
+  "homepage": "https://github.com/gio1612/omarchy-adoption"
 }

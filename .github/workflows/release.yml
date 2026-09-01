@@ -1,0 +1,112 @@
+name: Release
+
+# Installation is `omarchy plugin add https://github.com/gio1612/omarchy-adoption`,
+# which git-clones this repository -- so a "release" is a tag plus published
+# notes, not an artifact. What matters is that the tagged commit is one CI
+# already proved good, and that its version numbers agree.
+#
+#   git tag -a v0.3.0 -m "..." && git push origin v0.3.0
+#
+# Tag and manifest.json must match, or `verify` fails before anything ships.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)publish, e.g. v0.3.0"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # A tag must not be able to ship a tree that has not been through CI.
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  verify:
+    name: Version + tag agreement
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: resolve
+        name: Resolve tag
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: manifest.json / DAEMON_VERSION / tag must agree
+        run: ./tools/check-version.sh "${{ steps.resolve.outputs.tag }}"
+
+      - name: Tag must be on the default branch
+        # Prevents publishing a release from a stray branch or a detached
+        # experiment that was never merged.
+        run: |
+          if ! git branch -r --contains "${{ github.sha }}" | grep -qE "origin/${{ github.event.repository.default_branch }}$"; then
+            echo "tag ${{ steps.resolve.outputs.tag }} is not on ${{ github.event.repository.default_branch }}" >&2
+            exit 1
+          fi
+
+  publish:
+    name: Publish GitHub Release
+    needs: [ci, verify]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # required to create the release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build release notes
+        id: notes
+        env:
+          TAG: ${{ needs.verify.outputs.tag }}
+        run: |
+          PREV=$(git describe --tags --abbrev=0 "$TAG^" 2>/dev/null || true)
+          {
+            echo "## Install"
+            echo
+            echo '```sh'
+            echo "omarchy plugin add https://github.com/${{ github.repository }}"
+            echo "bash ~/.config/omarchy/plugins/io.github.gio1612.omarchy-adoption/scripts/setup.sh"
+            echo '```'
+            echo
+            echo "Then add the **Adoption Tracker** widget from Omarchy's widget picker."
+            echo
+            echo "Already installed? \`omarchy plugin update io.github.gio1612.omarchy-adoption\`,"
+            echo "then re-run \`setup.sh\` to update the daemon."
+            echo
+            echo "## Changes"
+            echo
+            if [ -n "$PREV" ]; then
+              git log --no-merges --pretty='- %s' "$PREV..$TAG"
+            else
+              git log --no-merges --pretty='- %s' "$TAG"
+            fi
+          } > release-notes.md
+          cat release-notes.md
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.verify.outputs.tag }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --notes-file release-notes.md --title "$TAG"
+          else
+            gh release create "$TAG" --notes-file release-notes.md --title "$TAG" --verify-tag
+          fi
